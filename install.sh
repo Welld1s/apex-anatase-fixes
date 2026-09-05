@@ -80,7 +80,7 @@ gamemode_shortcut_copied=0  # GameMode .desktop file copied to Desktop
 
 # Print an error message in red and exit with non-zero code
 error() {
-    echo -e "${RED}[ERROR] $*${NC}" >&2
+    echo -e "${RED}$*${NC}" >&2
     exit 1
 }
 
