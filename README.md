@@ -5,7 +5,7 @@ A utility for automatically applying all necessary fixes for the **OneXPlayer Ap
 
 ## DISCLAIMER
 
-**Important:** The fixes provided by this script are **not part of the official Anatase OS** and are offered **as-is**. The author of Anatase OS ([antheas](https://github.com/antheas)) is **not responsible** for any issues that may arise from using this script. These fixes were created by the community to address specific hardware quirks and are provided for convenience only.
+**Important:** The fixes provided by this script are **not part of the official Anatase OS** and are offered **as-is**. The author of Anatase OS ([antheas](https://github.com/antheas)) is **not responsible** for any issues that may arise from using this script. These fixes were created by the community to address specific hardware and software quirks and are provided for convenience only.
 
 The script is **not endorsed** by the Anatase OS development team. Use it at your own risk.
 
