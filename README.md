@@ -2,7 +2,6 @@
 
 A utility for automatically applying all necessary fixes for the **OneXPlayer Apex** handheld console running **Anatase OS** (an rpm-ostree based distribution).
 
----
 
 ## DISCLAIMER
 
@@ -10,7 +9,6 @@ A utility for automatically applying all necessary fixes for the **OneXPlayer Ap
 
 The script is **not endorsed** by the Anatase OS development team. Use it at your own risk.
 
----
 
 ## 📌 What this script does
 
@@ -25,7 +23,6 @@ The script is **not endorsed** by the Anatase OS development team. Use it at you
 
 The script is **idempotent** – running it multiple times won't make unnecessary changes.
 
----
 
 ## ⚙️ Requirements
 
@@ -35,7 +32,6 @@ The script is **idempotent** – running it multiple times won't make unnecessar
 - `rpm-ostree` installed (comes with Anatase OS)
 - Internet connection (for the one-liner install)
 
----
 
 ## 🚀 Installation and Usage
 
@@ -46,7 +42,6 @@ curl -fsSL https://raw.githubusercontent.com/Welld1s/apex-anatase-fixes/main/ins
 
 The script will prompt for your `sudo` password if needed. After successful execution, it will display colored notifications about what was actually changed.
 
----
 
 ## 📋 What the script does step by step
 
@@ -60,7 +55,6 @@ The script will prompt for your `sudo` password if needed. After successful exec
 5. **Copies** `gamemode.desktop` to the Desktop if missing or different.
 6. **Informs** the user about the required reboot and BIOS setting.
 
----
 
 ## ⚠️ Important Notes
 
@@ -70,7 +64,6 @@ The script will prompt for your `sudo` password if needed. After successful exec
   This is necessary for proper suspend/resume behavior.
 - The script is safe to run multiple times – it won't duplicate kernel arguments or overwrite already correct settings.
 
----
 
 ## 🐛 Error Messages
 
@@ -81,7 +74,6 @@ The script will prompt for your `sudo` password if needed. After successful exec
 | `[ERROR] Fingerprint reader not found.` | The fingerprint sensor is missing; this is not an Apex. |
 | `[ERROR] Failed to add kernel argument: ...` | Issue with `rpm-ostree` (check network and permissions). |
 
----
 
 ## 🙏 Credits
 
@@ -95,18 +87,15 @@ This script wouldn't exist without the work of the following people:
 
 Thank you all for your contributions to the OneXPlayer community!
 
----
 
 ## 📄 License
 
 MIT License – use, modify, and distribute freely.
 
----
 
 ## 🤝 Contributing
 
 If you find a bug or want to add support for other OneXPlayer models, feel free to open an Issue or submit a Pull Request.
 
----
 
 **Made for OneXPlayer Apex owners on Anatase OS.**
