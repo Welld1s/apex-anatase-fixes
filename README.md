@@ -4,7 +4,7 @@ A utility for automatically applying all necessary fixes for the **OneXPlayer Ap
 
 ---
 
-## Disclaimer
+## DISCLAIMER
 
 **Important:** The fixes provided by this script are **not part of the official Anatase OS** and are offered **as-is**. The author of Anatase OS ([antheas](https://github.com/antheas)) is **not responsible** for any issues that may arise from using this script. These fixes were created by the community to address specific hardware quirks and are provided for convenience only.
 
@@ -12,7 +12,7 @@ The script is **not endorsed** by the Anatase OS development team. Use it at you
 
 ---
 
-## What this script does
+## 📌 What this script does
 
 - **Blocks fingerprint wake-on-touch**  
   A light touch on the power button's fingerprint sensor would wake the device from sleep, which is annoying when carrying it in a bag. The script disables this behavior immediately (via PME) and makes it persistent across reboots (kernel argument + udev rule).
@@ -27,7 +27,7 @@ The script is **idempotent** – running it multiple times won't make unnecessar
 
 ---
 
-## Requirements
+## ⚙️ Requirements
 
 - Hardware: **OneXPlayer Apex** (verified via DMI and the presence of the FocalTech `2808:c652` fingerprint reader)
 - OS: **Anatase OS** (ID=anatase in `/etc/os-release`)
@@ -37,7 +37,7 @@ The script is **idempotent** – running it multiple times won't make unnecessar
 
 ---
 
-## Installation and Usage
+## 🚀 Installation and Usage
 
 Copy and run this **single command** in your terminal:
 ```sh
@@ -48,7 +48,7 @@ The script will prompt for your `sudo` password if needed. After successful exec
 
 ---
 
-## What the script does step by step
+## 📋 What the script does step by step
 
 1. **Verifies** that the system is Anatase OS and the hardware is OneXPlayer Apex.
 2. **Locates** the xHCI controller that hosts the fingerprint reader.
@@ -62,7 +62,7 @@ The script will prompt for your `sudo` password if needed. After successful exec
 
 ---
 
-## Important Notes
+## ⚠️ Important Notes
 
 - **A reboot is required** – kernel arguments only take effect after restarting.
 - **BIOS setting** – after reboot, enter the BIOS (usually by pressing `Del` during boot) and set:  
@@ -72,7 +72,7 @@ The script will prompt for your `sudo` password if needed. After successful exec
 
 ---
 
-## Error Messages
+## 🐛 Error Messages
 
 | Error | Meaning |
 |-------|---------|
@@ -83,7 +83,7 @@ The script will prompt for your `sudo` password if needed. After successful exec
 
 ---
 
-## Credits
+## 🙏 Credits
 
 This script wouldn't exist without the work of the following people:
 
@@ -97,13 +97,13 @@ Thank you all for your contributions to the OneXPlayer community!
 
 ---
 
-## License
+## 📄 License
 
 MIT License – use, modify, and distribute freely.
 
 ---
 
-## Contributing
+## 🤝 Contributing
 
 If you find a bug or want to add support for other OneXPlayer models, feel free to open an Issue or submit a Pull Request.
 
