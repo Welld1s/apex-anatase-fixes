@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# apex-anatase-fixes.sh
+# apex-anatase-fixes
 #
 # Description:
 #   Applies all known fixes for OneXPlayer Apex running Anatase OS.
@@ -21,7 +21,7 @@ set -euo pipefail
 # Script metadata
 # -----------------------------------------------------------------------------
 SCRIPT_VERSION="1.0.0"
-echo "OneXPlayer Apex Anatase Fixes v$SCRIPT_VERSION"
+echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
 # Auto-elevate to root if not already
