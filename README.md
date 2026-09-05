@@ -1,6 +1,6 @@
 # apex-anatase-fixes
 
-A utility for automatically applying all necessary fixes for the **OneXPlayer Apex** handheld console running **Anatase OS** (an rpm-ostree based distribution).
+A utility for automatically applying all necessary fixes for the **OneXPlayer Apex** handheld console running ([**Anatase OS**](https://anatase.org/)) (an rpm-ostree based distribution).
 
 
 ## DISCLAIMER
