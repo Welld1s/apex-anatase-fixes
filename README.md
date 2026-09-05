@@ -75,10 +75,10 @@ The script will prompt for your `sudo` password if needed. After successful exec
 
 | Error | Meaning |
 |-------|---------|
-| `[ERROR] Anatase OS not detected.` | The script is not running on Anatase OS. |
-| `[ERROR] This hardware is not a OneXPlayer Apex ...` | The hardware doesn't match (checked via DMI). |
-| `[ERROR] Fingerprint reader not found.` | The fingerprint sensor is missing; this is not an Apex. |
-| `[ERROR] Failed to add kernel argument: ...` | Issue with `rpm-ostree` (check network and permissions). |
+| `Anatase OS not detected.` | The script is not running on Anatase OS. |
+| `This hardware is not a OneXPlayer Apex ...` | The hardware doesn't match (checked via DMI). |
+| `Fingerprint reader not found.` | The fingerprint sensor is missing; this is not an Apex. |
+| `Failed to add kernel argument: ...` | Issue with `rpm-ostree` (check network and permissions). |
 
 
 
