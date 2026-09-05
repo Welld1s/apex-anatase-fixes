@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# apex-anatase-fixes
+# apex-anatase-fixes.sh
 #
 # Description:
 #   Applies all known fixes for OneXPlayer Apex running Anatase OS.
@@ -15,21 +15,21 @@ set -euo pipefail
 #   and only applies what is missing.
 #
 # Version: 1.0.0
-# Author:  (generated)
 # =============================================================================
-
-# -----------------------------------------------------------------------------
-# Auto-elevate to root if not already
-# -----------------------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-    echo "Requesting root privileges..."
-    exec sudo "$0" "$@"
-fi
 
 # -----------------------------------------------------------------------------
 # Script metadata
 # -----------------------------------------------------------------------------
 SCRIPT_VERSION="1.0.0"
+echo "OneXPlayer Apex Anatase Fixes v$SCRIPT_VERSION"
+
+# -----------------------------------------------------------------------------
+# Auto-elevate to root if not already
+# -----------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    echo "[1/3] Requesting root privileges..."
+    exec sudo "$0" "$@"
+fi
 
 # -----------------------------------------------------------------------------
 # Color definitions for terminal output
@@ -307,10 +307,8 @@ copy_gamemode_shortcut() {
 # Main script execution
 # -----------------------------------------------------------------------------
 
-echo "apex-anatase-fixes v$SCRIPT_VERSION"
-
-# Phase 1: Preparation (OS and hardware validation)
-echo "Preparing..."
+# Phase 2: Preparation (OS and hardware validation)
+echo "[2/3] Preparing..."
 check_os
 check_hardware
 
@@ -320,43 +318,38 @@ if [[ -z "$controller" ]]; then
     error "Fingerprint controller not found."
 fi
 
-# Phase 2: Apply fixes
-echo "Applying fixes..."
+# Phase 3: Apply fixes
+echo "[3/3] Applying fixes..."
 
-# 2.1 Fingerprint wake blocker (PME + udev)
+# 3.1 Fingerprint wake blocker (PME + udev)
 disable_fp_pme "$controller"
 
-# 2.2 Fingerprint kernel argument (closes the GPIO wake path)
+# 3.2 Fingerprint kernel argument (closes the GPIO wake path)
 add_karg "$FP_KARG" 0
 
-# 2.3 Sleep stability kernel arguments
+# 3.3 Sleep stability kernel arguments
 for karg in "${SLEEP_KARGS[@]}"; do
     add_karg "$karg" 1
 done
 
-# 2.4 GameMode desktop shortcut (copy, not symlink)
+# 3.4 GameMode desktop shortcut (copy, not symlink)
 copy_gamemode_shortcut
 
 # -----------------------------------------------------------------------------
-# Phase 3: Final output (only show what actually changed)
+# Final output (only show what actually changed)
 # -----------------------------------------------------------------------------
 if [[ $fp_changed -eq 0 && $any_karg_changed -eq 0 && $gamemode_shortcut_copied -eq 0 ]]; then
     echo -e "${GREEN}All fixes are already applied.${NC}"
 else
     if [[ $fp_changed -eq 1 || $any_karg_changed -eq 1 || $gamemode_shortcut_copied -eq 1 ]]; then
         echo -e "${GREEN}All fixes applied successfully.${NC}"
-        echo
     fi
-
     if [[ $any_karg_changed -eq 1 ]]; then
         echo -e "${YELLOW}Reboot required for kernel arguments to take effect.${NC}"
-        echo
     fi
-
     if [[ $sleep_changed -eq 1 ]]; then
         echo -e "${YELLOW}Also, ensure BIOS setting: Advanced -> ACPI Settings -> Enable ACPI Auto Configuration -> Enabled${NC}"
     fi
-
     if [[ $gamemode_shortcut_copied -eq 1 ]]; then
         echo -e "${GREEN}GameMode shortcut copied to Desktop.${NC}"
     fi
