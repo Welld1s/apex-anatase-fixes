@@ -10,6 +10,7 @@ A utility for automatically applying all necessary fixes for the **OneXPlayer Ap
 The script is **not endorsed** by the Anatase OS development team. Use it at your own risk.
 
 
+
 ## 📌 What this script does
 
 - **Blocks fingerprint wake-on-touch**  
@@ -24,6 +25,7 @@ The script is **not endorsed** by the Anatase OS development team. Use it at you
 The script is **idempotent** – running it multiple times won't make unnecessary changes.
 
 
+
 ## ⚙️ Requirements
 
 - Hardware: **OneXPlayer Apex** (verified via DMI and the presence of the FocalTech `2808:c652` fingerprint reader)
@@ -31,6 +33,7 @@ The script is **idempotent** – running it multiple times won't make unnecessar
 - **root** privileges (the script will request sudo automatically)
 - `rpm-ostree` installed (comes with Anatase OS)
 - Internet connection (for the one-liner install)
+
 
 
 ## 🚀 Installation and Usage
@@ -41,6 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/Welld1s/apex-anatase-fixes/main/ins
 ```
 
 The script will prompt for your `sudo` password if needed. After successful execution, it will display colored notifications about what was actually changed.
+
 
 
 ## 📋 What the script does step by step
@@ -56,6 +60,7 @@ The script will prompt for your `sudo` password if needed. After successful exec
 6. **Informs** the user about the required reboot and BIOS setting.
 
 
+
 ## ⚠️ Important Notes
 
 - **A reboot is required** – kernel arguments only take effect after restarting.
@@ -63,6 +68,7 @@ The script will prompt for your `sudo` password if needed. After successful exec
   `Advanced -> ACPI Settings -> Enable ACPI Auto Configuration` -> **Enabled**.  
   This is necessary for proper suspend/resume behavior.
 - The script is safe to run multiple times – it won't duplicate kernel arguments or overwrite already correct settings.
+
 
 
 ## 🐛 Error Messages
@@ -73,6 +79,7 @@ The script will prompt for your `sudo` password if needed. After successful exec
 | `[ERROR] This hardware is not a OneXPlayer Apex ...` | The hardware doesn't match (checked via DMI). |
 | `[ERROR] Fingerprint reader not found.` | The fingerprint sensor is missing; this is not an Apex. |
 | `[ERROR] Failed to add kernel argument: ...` | Issue with `rpm-ostree` (check network and permissions). |
+
 
 
 ## 🙏 Credits
@@ -88,14 +95,17 @@ This script wouldn't exist without the work of the following people:
 Thank you all for your contributions to the OneXPlayer community!
 
 
+
 ## 📄 License
 
 MIT License – use, modify, and distribute freely.
 
 
+
 ## 🤝 Contributing
 
 If you find a bug or want to add support for other OneXPlayer models, feel free to open an Issue or submit a Pull Request.
+
 
 
 **Made for OneXPlayer Apex owners on Anatase OS.**
