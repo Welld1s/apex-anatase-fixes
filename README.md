@@ -17,7 +17,7 @@ The script is **not endorsed** by the Anatase OS development team. Use it at you
   A light touch on the power button's fingerprint sensor would wake the device from sleep, which is annoying when carrying it in a bag. The script disables this behavior immediately (via PME) and makes it persistent across reboots (kernel argument + udev rule).
 
 - **Fixes suspend/resume issues**  
-  Adds kernel arguments `amd_iommu=off` and `modprobe.blacklist=amdxdna`, which resolve hangs when resuming from sleep (S3).
+  Adds kernel argument `amd_iommu=off`, which resolve hangs when resuming from sleep (S3).
 
 - **GameMode desktop shortcut**  
   Copies `/usr/share/applications/gamemode.desktop` to the Desktop if not already present.
@@ -54,7 +54,6 @@ The script will prompt for your `sudo` password if needed. After successful exec
 4. **Adds kernel arguments** via `rpm-ostree kargs`:
    - `gpiolib_acpi.ignore_wake=AMDI0030:00@58` (closes the second wake path – GPIO)
    - `amd_iommu=off` (suspend stability)
-   - `modprobe.blacklist=amdxdna` (suspend stability)
 5. **Copies** `gamemode.desktop` to the Desktop if missing or different.
 6. **Informs** the user about the required reboot and BIOS setting.
 
@@ -87,9 +86,7 @@ This script wouldn't exist without the work of the following people:
 
 - **[antheas](https://github.com/antheas)** – for creating **Anatase OS**, the fantastic gaming-focused distribution that makes the OneXPlayer Apex truly shine.
 
-- **[srsholmes](https://github.com/srsholmes)** – for all the core fixes: fingerprint wake blocking, PME handling, and the `gpiolib_acpi.ignore_wake` kernel argument. His research and code form the foundation of this script.
-
-- **[aahmozart](https://github.com/aahmozart)** – for discovering the critical `modprobe.blacklist=amdxdna` kernel argument, which resolved persistent suspend/resume issues.
+- **[srsholmes](https://github.com/srsholmes)** – for all the fixes. His research and code form the foundation of this script.
 
 Thank you all for your contributions to the OneXPlayer community!
 
