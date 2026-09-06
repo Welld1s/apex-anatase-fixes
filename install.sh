@@ -165,7 +165,7 @@ check_rolling_branch() {
     fi
 
     if [[ "$image_ref" != *":rolling" ]]; then
-        error "Anatase OS is not on the rolling branch.\nCurrent image: $image_ref\nPlease rebase via:\n  HHD -> Updates -> Change Branch (Rebase) -> Branch -> Rolling"
+        error "Anatase OS is not on the rolling branch.\nCurrent image: $image_ref\nPlease rebase via:\n  HHD -> Updates -> Change Branch (Rebase) -> Branch -> Rolling\nRun the script again after a reboot."
     fi
 }
 
