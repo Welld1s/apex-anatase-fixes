@@ -5,14 +5,14 @@ set -euo pipefail
 # apex-anatase-fixes
 #
 # Description:
-#   Applies all known fixes for OneXPlayer Apex running Anatase OS.
+#   Applies all known fixes for OneXPlayer Apex running Anatase OS (rolling).
 #   Includes:
 #     - Fingerprint wake blocker (PME + kernel arg)
-#     - Sleep stability kernel args (amd_iommu=off, modprobe.blacklist=amdxdna)
+#     - Sleep stability kernel arg (amd_iommu=off)
 #     - GameMode desktop shortcut (copied from system-wide .desktop file)
 #
-#   The script is idempotent: it checks current state before making changes
-#   and only applies what is missing.
+#   The script is idempotent: it checks current state before making changes.
+#   IMPORTANT: This script requires Anatase OS on the "rolling" branch.
 #
 # Version: 1.0.0
 # =============================================================================
@@ -56,12 +56,6 @@ FP_UDEV_CONTENT='# Block wake from the xHCI controller hosting the FocalTech fin
 ACTION=="add", SUBSYSTEM=="pci", KERNEL=="%s", ATTR{power/wakeup}="disabled"
 '
 
-# Sleep fixes (kernel command line arguments)
-SLEEP_KARGS=(
-    "amd_iommu=off"
-    "modprobe.blacklist=amdxdna"
-)
-
 # GameMode desktop shortcut (source and destination name)
 GAMEMODE_DESKTOP_SRC="/usr/share/applications/gamemode.desktop"
 GAMEMODE_DESKTOP_NAME="gamemode.desktop"
@@ -70,8 +64,8 @@ GAMEMODE_DESKTOP_NAME="gamemode.desktop"
 # Global flags to track changes
 # -----------------------------------------------------------------------------
 fp_changed=0                # Fingerprint PME or udev rule changed
-any_karg_changed=0          # Any kernel argument was added
-sleep_changed=0             # Sleep-related kernel arguments added
+any_karg_changed=0          # Any kernel argument was added (or removed)
+sleep_changed=0             # Sleep-related kernel arguments changed
 gamemode_shortcut_copied=0  # GameMode .desktop file copied to Desktop
 
 # -----------------------------------------------------------------------------
@@ -101,7 +95,7 @@ get_real_home() {
 }
 
 # -----------------------------------------------------------------------------
-# OS and hardware validation
+# OS, hardware, and branch validation
 # -----------------------------------------------------------------------------
 
 # Verify that we are running on Anatase OS (ID=anatase)
@@ -113,6 +107,29 @@ check_os() {
     source /etc/os-release
     if [[ "$ID" != "anatase" ]]; then
         error "This script is for Anatase OS (detected: $ID)."
+    fi
+}
+
+# Verify that the system is on the "rolling" branch
+check_rolling_branch() {
+    if ! command -v bootc &>/dev/null; then
+        error "bootc command not found. Is this Anatase OS?"
+    fi
+
+    local json_output
+    if ! json_output=$(bootc status --json 2>/dev/null); then
+        error "Failed to get bootc status. Are you running as root?"
+    fi
+
+    # Extract the image reference (e.g., "i.anatase.org/anatase:rolling")
+    local image_ref
+    image_ref=$(echo "$json_output" | grep -o '"image":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [[ -z "$image_ref" ]]; then
+        error "Could not determine current image from bootc status."
+    fi
+
+    if [[ "$image_ref" != *":rolling" ]]; then
+        error "Anatase OS is not on the rolling branch.\nCurrent image: $image_ref\nPlease rebase via:\n  HHD -> Updates -> Change Branch (Rebase) -> Branch -> Rolling\nRun the script again after a reboot."
     fi
 }
 
@@ -218,21 +235,17 @@ disable_fp_pme() {
 # Kernel argument management (rpm-ostree)
 # -----------------------------------------------------------------------------
 
-# Add a kernel argument using rpm-ostree kargs --append-if-missing.
-# Only applies if not already present in the current kargs list.
-# Sets global flags:
-#   - any_karg_changed = 1 if any argument was added
-#   - sleep_changed = 1 if the argument is one of the sleep fixes
+# Generic function to add a kernel argument if not already present.
 add_karg() {
     local karg="$1"
-    local is_sleep="$2"          # 1 = sleep fix, 0 = fingerprint karg
+    local is_sleep="$2"          # 1 = sleep fix (currently only used for tracking)
 
     # Check if already present
     if rpm-ostree kargs | grep -q "$karg"; then
         return 0                 # Already present, no change
     fi
 
-    # Add it (idempotent)
+    # Add it
     if ! rpm-ostree kargs --append-if-missing="$karg" &>/dev/null; then
         error "Failed to add kernel argument: $karg"
     fi
@@ -242,6 +255,47 @@ add_karg() {
         sleep_changed=1
     fi
     return 1
+}
+
+# Specialised function to set amd_iommu=off cleanly:
+# - Removes any existing amd_iommu=* arguments
+# - Adds amd_iommu=off
+# Sets any_karg_changed and sleep_changed if any change occurred.
+add_amd_iommu_off() {
+    local target="amd_iommu=off"
+    local changed=0
+
+    # Get current kargs, filter for amd_iommu=*
+    local current_kargs
+    current_kargs=$(rpm-ostree kargs)
+
+    # Collect all arguments that start with amd_iommu=
+    local old_args=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^amd_iommu= ]]; then
+            old_args+=("$line")
+        fi
+    done <<< "$current_kargs"
+
+    # Remove each old argument
+    for arg in "${old_args[@]}"; do
+        if rpm-ostree kargs --delete-if-present="$arg" &>/dev/null; then
+            changed=1
+        fi
+    done
+
+    # Add the new one if not already present (after removal it should be absent)
+    if ! rpm-ostree kargs | grep -q "$target"; then
+        if rpm-ostree kargs --append-if-missing="$target" &>/dev/null; then
+            changed=1
+        fi
+    fi
+
+    if [[ $changed -eq 1 ]]; then
+        any_karg_changed=1
+        sleep_changed=1
+    fi
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -307,9 +361,10 @@ copy_gamemode_shortcut() {
 # Main script execution
 # -----------------------------------------------------------------------------
 
-# Phase 2: Preparation (OS and hardware validation)
+# Phase 2: Preparation (OS, branch, and hardware validation)
 echo "[2/3] Preparing..."
 check_os
+check_rolling_branch
 check_hardware
 
 # Locate the fingerprint controller
@@ -327,10 +382,8 @@ disable_fp_pme "$controller"
 # 3.2 Fingerprint kernel argument (closes the GPIO wake path)
 add_karg "$FP_KARG" 0
 
-# 3.3 Sleep stability kernel arguments
-for karg in "${SLEEP_KARGS[@]}"; do
-    add_karg "$karg" 1
-done
+# 3.3 Sleep stability kernel argument (amd_iommu=off) – cleaned up properly
+add_amd_iommu_off
 
 # 3.4 GameMode desktop shortcut (copy, not symlink)
 copy_gamemode_shortcut
