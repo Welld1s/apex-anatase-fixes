@@ -14,13 +14,13 @@ set -euo pipefail
 #   The script is idempotent: it checks current state before making changes
 #   and only applies what is missing.
 #
-# Version: 1.0.1
+# Version: 1.0.2
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Script metadata
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
@@ -313,8 +313,5 @@ else
     fi
     if [[ $sleep_changed -eq 1 ]]; then
         echo -e "${YELLOW}Also, ensure BIOS setting: Advanced -> ACPI Settings -> Enable ACPI Auto Configuration -> Enabled${NC}"
-    fi
-    if [[ $gamemode_shortcut_copied -eq 1 ]]; then
-        echo -e "${GREEN}GameMode shortcut copied to Desktop.${NC}"
     fi
 fi
