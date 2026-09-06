@@ -28,10 +28,9 @@ The script is **idempotent** – running it multiple times won't make unnecessar
 
 ## ⚙️ Requirements
 
-- Hardware: **OneXPlayer Apex** (verified via DMI and the presence of the FocalTech `2808:c652` fingerprint reader)
-- OS: **Anatase OS** (ID=anatase in `/etc/os-release`)
+- Hardware: **OneXPlayer Apex**
+- OS: **Anatase OS** on the **rolling** release branch
 - **root** privileges (the script will request sudo automatically)
-- `rpm-ostree` installed (comes with Anatase OS)
 - Internet connection (for the one-liner install)
 
 
@@ -43,7 +42,7 @@ Copy and run this **single command** in your terminal:
 curl -fsSL https://raw.githubusercontent.com/Welld1s/apex-anatase-fixes/main/install.sh | sh
 ```
 
-The script will prompt for your `sudo` password if needed. After successful execution, it will display colored notifications about what was actually changed.
+The script will prompt for your `sudo` password if needed. After successful execution, it will display colored notifications about what was done.
 
 
 
