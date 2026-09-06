@@ -14,7 +14,7 @@ set -euo pipefail
 #   The script is idempotent: it checks current state before making changes
 #   and only applies what is missing.
 #
-# Version: 1.0.2
+# Version: 1.0.3
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -50,7 +50,7 @@ EXPECTED_BOARD_NAME="ONEXPLAYER APEX"
 FP_VENDOR="2808"
 FP_PRODUCT="c652"
 FP_KARG="gpiolib_acpi.ignore_wake=AMDI0030:00@58"
-FP_UDEV_RULE="/etc/udev/rules.d/90-loadout-fingerprint-no-wake.rules"
+FP_UDEV_RULE="/etc/udev/rules.d/90-fingerprint-no-wake.rules"
 FP_UDEV_CONTENT='# Block wake from the xHCI controller hosting the FocalTech fingerprint
 # reader. Managed by apex-anatase-fixes.sh.
 ACTION=="add", SUBSYSTEM=="pci", KERNEL=="%s", ATTR{power/wakeup}="disabled"
