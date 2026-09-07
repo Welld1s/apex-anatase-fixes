@@ -46,19 +46,6 @@ The script will prompt for your `sudo` password if needed. After successful exec
 
 
 
-## 📋 What the script does step by step
-
-1. **Verifies** that the system is Anatase OS and the hardware is OneXPlayer Apex.
-2. **Locates** the xHCI controller that hosts the fingerprint reader.
-3. **Disables PME wake** by writing `disabled` to `/sys/bus/pci/devices/.../power/wakeup` and installs a udev rule to persist this setting across reboots.
-4. **Adds kernel arguments** via `rpm-ostree kargs`:
-   - `gpiolib_acpi.ignore_wake=AMDI0030:00@58` (closes the second wake path – GPIO)
-   - `amd_iommu=off` (suspend stability)
-5. **Copies** `gamemode.desktop` to the Desktop if missing or different.
-6. **Informs** the user about the required reboot and BIOS setting.
-
-
-
 ## ⚠️ Important Notes
 
 - **A reboot is required** – kernel arguments only take effect after restarting.
@@ -66,17 +53,6 @@ The script will prompt for your `sudo` password if needed. After successful exec
   `Advanced -> ACPI Settings -> Enable ACPI Auto Configuration` -> **Enabled**.  
   This is necessary for proper suspend/resume behavior.
 - The script is safe to run multiple times – it won't duplicate kernel arguments or overwrite already correct settings.
-
-
-
-## 🐛 Error Messages
-
-| Error | Meaning |
-|-------|---------|
-| `Anatase OS not detected.` | The script is not running on Anatase OS. |
-| `This hardware is not a OneXPlayer Apex ...` | The hardware doesn't match (checked via DMI). |
-| `Fingerprint reader not found.` | The fingerprint sensor is missing; this is not an Apex. |
-| `Failed to add kernel argument: ...` | Issue with `rpm-ostree` (check network and permissions). |
 
 
 
