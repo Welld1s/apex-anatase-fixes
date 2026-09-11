@@ -12,8 +12,6 @@ The script is **not endorsed** by the Anatase OS development team. Use it at you
 
 The script applies the following stages, each reported with its own status (`done`, `exists`, or `error`):
 
-- **Sleep fix** — Adds the `amd_iommu=off` kernel argument (deduplicated), which resolves hangs when resuming from sleep (S3).
-
 - **Fingerprint sensor tweaks** — A light touch on the power button's fingerprint sensor would wake the device from sleep, which is annoying when carrying it in a bag. The script disables this via two paths: the PCIe PME wake of the reader's xHCI controller (runtime + persistent udev rule) and the GPIO wake line (`gpiolib_acpi.ignore_wake` kernel argument).
 
 - **Gamemode shortcut** — Copies `/usr/share/applications/gamemode.desktop` to the user's Desktop folder (supports localized Desktop folder names).
@@ -42,9 +40,9 @@ The script will prompt for your `sudo` password if needed. Each stage prints its
 
 ## ⚠️ Important Notes
 
-- **A reboot is required** if kernel arguments were changed (Sleep fix or Fingerprint sensor tweaks). The script will tell you at the end.
+- **A reboot is required** if the fingerprint GPIO kernel argument was added. The script will tell you at the end.
 
-- **BIOS setting** — if the sleep fix was applied, enter the BIOS (usually by pressing `Del` during boot) and set: `Advanced -> ACPI Settings -> Enable ACPI Auto Configuration` -> **Enabled**. This is necessary for proper suspend/resume behavior.
+- **BIOS setting** — when the fingerprint sensor tweaks stage adds the GPIO kernel argument, enter the BIOS (usually by pressing `Del` during boot) and set: `Advanced -> ACPI Settings -> Enable ACPI Auto Configuration` -> **Enabled**. This is necessary for proper suspend/resume behavior.
 
 - The script is safe to run multiple times – it won't duplicate kernel arguments or overwrite already correct settings.
 
