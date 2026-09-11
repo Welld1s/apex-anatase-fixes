@@ -8,21 +8,19 @@ set -euo pipefail
 #   Applies all known fixes for OneXPlayer Apex running Anatase OS.
 #   Stages:
 #     Preparation               - validate OS, version, hardware
-#     Sleep fix                 - kernel arg
-#     Fingerprint sensor tweaks - PME disable + udev rule + kernel arg
+#     Fingerprint sensor tweaks - PME disable + udev rule + GPIO kernel arg
 #     Gamemode shortcut         - copy .desktop to user's Desktop
 #     HHD settings              - apply curated HHD preset
-#     Readiness                 - reboot / BIOS reminders if needed
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.1.1
+# Version: 1.2.0
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Script metadata
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
@@ -58,11 +56,6 @@ FP_UDEV_CONTENT='# Block wake from the xHCI controller hosting the FocalTech fin
 # reader. Managed by apex-anatase-fixes.sh.
 ACTION=="add", SUBSYSTEM=="pci", KERNEL=="%s", ATTR{power/wakeup}="disabled"
 '
-
-# Sleep-related kernel arguments (key=value)
-SLEEP_KARGS=(
-    "amd_iommu=off"
-)
 
 # GameMode desktop shortcut
 GAMEMODE_DESKTOP_SRC="/usr/share/applications/gamemode.desktop"
@@ -225,40 +218,6 @@ prepare() {
 }
 
 # -----------------------------------------------------------------------------
-# Stage: Sleep fix
-# -----------------------------------------------------------------------------
-run_sleep_stage() {
-    local changed=0 current karg key line
-
-    current=$(rpm-ostree kargs 2>/dev/null) || return 1
-
-    for karg in "${SLEEP_KARGS[@]}"; do
-        key="${karg%%=*}"
-
-        while IFS= read -r line; do
-            [[ "$line" == "$key="* ]] || continue
-            [[ "$line" == "$karg" ]] && continue
-            rpm-ostree kargs --delete-if-present="$line" &>/dev/null || return 1
-            changed=1
-        done <<< "$current"
-
-        if [[ "$current" != *"$karg"* ]]; then
-            rpm-ostree kargs --append-if-missing="$karg" &>/dev/null || return 1
-            changed=1
-        fi
-    done
-
-    if [[ $changed -eq 1 ]]; then
-        reboot_needed=1
-        bios_needed=1
-        print_status "Sleep fix" "done"
-    else
-        print_status "Sleep fix" "exists"
-    fi
-    return 0
-}
-
-# -----------------------------------------------------------------------------
 # Stage: Fingerprint sensor tweaks
 # -----------------------------------------------------------------------------
 # Non-critical stage: if the reader is not present or its controller cannot
@@ -312,6 +271,7 @@ run_fingerprint_stage() {
             || { FP_FAIL_REASON="Failed to add GPIO kernel argument."; return 1; }
         changed=1
         reboot_needed=1
+        bios_needed=1
     fi
 
     if [[ $changed -eq 1 ]]; then
@@ -398,13 +358,6 @@ else
     print_status "Preparation" "error" "$PREP_FAIL_REASON"
     echo -e "${RED}All fixes failed to install.${NC}"
     exit 1
-fi
-
-if run_sleep_stage; then
-    stages_ok=$((stages_ok + 1))
-else
-    print_status "Sleep fix" "error"
-    stages_error=$((stages_error + 1))
 fi
 
 if run_fingerprint_stage; then
