@@ -18,7 +18,7 @@ The script applies the following stages, each reported with its own status (`don
 
 - **Gamemode shortcut** — Copies `/usr/share/applications/gamemode.desktop` to the user's Desktop folder (supports localized Desktop folder names).
 
-- **HHD settings** — Applies a curated Handheld Daemon preset: custom TDP (55 W), manual fan curve, AMD energy mode, RGB (cyberpunk), OXP controller mode with `hori_steam` layout, vibration strength, and GameMode power/battery behaviour. All settings are applied via `hhdctl set` after a full `hhd.settings.reset`.
+- **HHD settings** — Applies a curated Handheld Daemon preset: custom TDP (55 W), manual fan curve, AMD energy mode, RGB (cyberpunk), OXP controller mode with `hori_steam` layout, vibration strength, GameMode behaviour and power/battery configuration. All settings are applied via `hhdctl set` after a full `hhd.settings.reset`.
 
 The script is **idempotent** – running it multiple times won't make unnecessary changes.
 
@@ -28,7 +28,7 @@ The script is **idempotent** – running it multiple times won't make unnecessar
 - OS: **Anatase OS** version **20260907.10** or newer
 - **root** privileges (the script will request sudo automatically)
 - Internet connection
-- **HHD** (comes with Anatase OS; if absent, the HHD stage is skipped silently)
+- **HHD** (comes with Anatase OS; if absent, the HHD stage is skipped)
 
 ## 🚀 Installation and Usage
 
@@ -54,7 +54,7 @@ The script will prompt for your `sudo` password if needed. Each stage prints its
 
 This script wouldn't exist without the work of the following people:
 
-- **[antheas](https://github.com/antheas)** – for creating **Anatase OS**, the fantastic gaming-focused distribution that makes the OneXPlayer Apex truly shine.
+- **[antheas](https://github.com/antheas)** – for creating **Anatase OS** and **HHD**, the fantastic software that makes the OneXPlayer Apex truly shine.
 
 - **[srsholmes](https://github.com/srsholmes)** – for all the fixes. His research and code form the foundation of this script.
 
