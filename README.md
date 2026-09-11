@@ -1,7 +1,6 @@
 # apex-anatase-fixes
 
-A utility for automatically applying all necessary fixes for the **OneXPlayer Apex** handheld console running [**Anatase OS**](https://anatase.org/) (an rpm-ostree based distribution).
-
+A utility for automatically applying all necessary fixes and tweaks for the **OneXPlayer Apex** handheld console running [**Anatase OS**](https://anatase.org/) (an rpm-ostree based distribution).
 
 ## DISCLAIMER
 
@@ -9,52 +8,47 @@ A utility for automatically applying all necessary fixes for the **OneXPlayer Ap
 
 The script is **not endorsed** by the Anatase OS development team. Use it at your own risk.
 
-
-
 ## 📌 What this script does
 
-- **Blocks fingerprint wake-on-touch**  
-  A light touch on the power button's fingerprint sensor would wake the device from sleep, which is annoying when carrying it in a bag. The script disables this behavior immediately (via PME) and makes it persistent across reboots (kernel argument + udev rule).
+The script applies the following stages, each reported with its own status (`done`, `exists`, or `error`):
 
-- **Fixes suspend/resume issues**  
-  Adds kernel argument `amd_iommu=off`, which resolve hangs when resuming from sleep (S3).
+- **Sleep fix** — Adds the `amd_iommu=off` kernel argument (deduplicated), which resolves hangs when resuming from sleep (S3).
 
-- **GameMode desktop shortcut**  
-  Copies `/usr/share/applications/gamemode.desktop` to the Desktop if not already present.
+- **Fingerprint sensor tweaks** — A light touch on the power button's fingerprint sensor would wake the device from sleep, which is annoying when carrying it in a bag. The script disables this via two paths: the PCIe PME wake of the reader's xHCI controller (runtime + persistent udev rule) and the GPIO wake line (`gpiolib_acpi.ignore_wake` kernel argument).
+
+- **Gamemode shortcut** — Copies `/usr/share/applications/gamemode.desktop` to the user's Desktop folder (supports localized Desktop folder names).
+
+- **HHD settings** — Applies a curated Handheld Daemon preset: custom TDP (55 W), manual fan curve, AMD energy mode, RGB (cyberpunk), OXP controller mode with `hori_steam` layout, vibration strength, and GameMode power/battery behaviour. All settings are applied via `hhdctl set` after a full `hhd.settings.reset`.
 
 The script is **idempotent** – running it multiple times won't make unnecessary changes.
-
-
 
 ## ⚙️ Requirements
 
 - Hardware: **OneXPlayer Apex**
-- OS: **Anatase OS** on the **rolling** release branch
+- OS: **Anatase OS** version **20260907.10** or newer
 - **root** privileges (the script will request sudo automatically)
-- Internet connection (for the one-liner install)
-
-
+- Internet connection
+- **HHD** (comes with Anatase OS; if absent, the HHD stage is skipped silently)
 
 ## 🚀 Installation and Usage
 
 Copy and run this **single command** in your terminal:
-```sh
+
+```
 curl -fsSL https://raw.githubusercontent.com/Welld1s/apex-anatase-fixes/main/install.sh | sh
 ```
 
-The script will prompt for your `sudo` password if needed. After successful execution, it will display colored notifications about what was done.
-
-
+The script will prompt for your `sudo` password if needed. Each stage prints its own status line, and the final summary tells you whether a reboot and/or BIOS tweak is required.
 
 ## ⚠️ Important Notes
 
-- **A reboot is required** – kernel arguments only take effect after restarting.
-- **BIOS setting** – after reboot, enter the BIOS (usually by pressing `Del` during boot) and set:  
-  `Advanced -> ACPI Settings -> Enable ACPI Auto Configuration` -> **Enabled**.  
-  This is necessary for proper suspend/resume behavior.
+- **A reboot is required** if kernel arguments were changed (Sleep fix or Fingerprint sensor tweaks). The script will tell you at the end.
+
+- **BIOS setting** — if the sleep fix was applied, enter the BIOS (usually by pressing `Del` during boot) and set: `Advanced -> ACPI Settings -> Enable ACPI Auto Configuration` -> **Enabled**. This is necessary for proper suspend/resume behavior.
+
 - The script is safe to run multiple times – it won't duplicate kernel arguments or overwrite already correct settings.
 
-
+- If you are not on Anatase OS, not on a OneXPlayer Apex, or your OS version is too old, the script exits during the **Preparation** stage with a clear error message and does not modify anything.
 
 ## 🙏 Credits
 
@@ -66,18 +60,12 @@ This script wouldn't exist without the work of the following people:
 
 Thank you all for your contributions to the OneXPlayer community!
 
-
-
 ## 📄 License
 
 MIT License – use, modify, and distribute freely.
 
-
-
 ## 🤝 Contributing
 
 If you find a bug or want to add support for other OneXPlayer models, feel free to open an Issue or submit a Pull Request.
-
-
 
 **Made for OneXPlayer Apex owners on Anatase OS.**
