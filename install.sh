@@ -16,13 +16,13 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.1.0
+# Version: 1.1.1
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Script metadata
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
@@ -105,21 +105,31 @@ HHD_SETTINGS=(
 # -----------------------------------------------------------------------------
 # State
 # -----------------------------------------------------------------------------
-FP_CONTROLLER=""
 reboot_needed=0
 bios_needed=0
+
+stages_ok=0
+stages_error=0
+
+PREP_FAIL_REASON=""
+FP_FAIL_REASON=""
 
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+# Print a stage line and, optionally, a reason on the next line in red.
 print_status() {
-    local stage="$1" status="$2" color
+    local stage="$1" status="$2" reason="${3:-}"
+    local color
     case "$status" in
         done|exists) color="$GREEN" ;;
-        error) color="$RED" ;;
-        *) color="$NC" ;;
+        error)       color="$RED" ;;
+        *)           color="$NC" ;;
     esac
     printf "${WHITE}%s${NC} - ${color}%s${NC}\n" "$stage" "$status"
+    if [[ -n "$reason" ]]; then
+        echo -e "${RED}${reason}${NC}"
+    fi
 }
 
 get_real_user() {
@@ -162,63 +172,52 @@ find_fp_controller() {
 }
 
 # -----------------------------------------------------------------------------
-# Stage: Preparation
+# Stage: Preparation (hard gate — exits on failure)
 # -----------------------------------------------------------------------------
 prepare() {
     # OS check
     if [[ ! -f /etc/os-release ]]; then
-        echo -e "${RED}Anatase OS not detected.${NC}" >&2
+        PREP_FAIL_REASON="Anatase OS not detected."
         return 1
     fi
     source /etc/os-release
     if [[ "$ID" != "anatase" ]]; then
-        echo -e "${RED}Not Anatase OS (detected: $ID).${NC}" >&2
+        PREP_FAIL_REASON="Not Anatase OS (detected: $ID)."
         return 1
     fi
 
     # Version check
     if ! command -v bootc &>/dev/null; then
-        echo -e "${RED}bootc not found.${NC}" >&2
+        PREP_FAIL_REASON="bootc not found."
         return 1
     fi
     local json version
     if ! json=$(bootc status --json 2>/dev/null); then
-        echo -e "${RED}Failed to get bootc status.${NC}" >&2
+        PREP_FAIL_REASON="Failed to get bootc status."
         return 1
     fi
     version=$(echo "$json" | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
     if [[ -z "$version" ]]; then
-        echo -e "${RED}Could not determine Anatase OS version.${NC}" >&2
+        PREP_FAIL_REASON="Could not determine Anatase OS version."
         return 1
     fi
     if [[ "$version" < "$MIN_ANATASE_VERSION" ]]; then
-        echo -e "${RED}Anatase OS version $version is too old (minimum: $MIN_ANATASE_VERSION).${NC}" >&2
-        echo -e "${RED}Please update via HHD → Updates.${NC}" >&2
+        PREP_FAIL_REASON="Anatase OS version $version is too old (minimum: $MIN_ANATASE_VERSION).\nPlease update via HHD → Updates."
         return 1
     fi
 
-    # Hardware check
+    # Hardware check (DMI only – fingerprint reader is non-critical)
     local vendor name
     if ! vendor=$(cat /sys/class/dmi/id/board_vendor 2>/dev/null); then
-        echo -e "${RED}Cannot read DMI information.${NC}" >&2
+        PREP_FAIL_REASON="Cannot read DMI information."
         return 1
     fi
     if ! name=$(cat /sys/class/dmi/id/board_name 2>/dev/null); then
-        echo -e "${RED}Cannot read DMI information.${NC}" >&2
+        PREP_FAIL_REASON="Cannot read DMI information."
         return 1
     fi
     if [[ "$vendor" != "$EXPECTED_BOARD_VENDOR" || "$name" != "$EXPECTED_BOARD_NAME" ]]; then
-        echo -e "${RED}Not a OneXPlayer Apex (detected: $vendor $name).${NC}" >&2
-        return 1
-    fi
-    if ! lsusb -d "${FP_VENDOR}:${FP_PRODUCT}" &>/dev/null; then
-        echo -e "${RED}Fingerprint reader not found.${NC}" >&2
-        return 1
-    fi
-
-    # Fingerprint controller lookup (needed by the fingerprint sensor tweaks stage)
-    if ! FP_CONTROLLER=$(find_fp_controller); then
-        echo -e "${RED}Fingerprint controller not found.${NC}" >&2
+        PREP_FAIL_REASON="Not a OneXPlayer Apex (detected: $vendor $name)."
         return 1
     fi
 
@@ -236,7 +235,6 @@ run_sleep_stage() {
     for karg in "${SLEEP_KARGS[@]}"; do
         key="${karg%%=*}"
 
-        # Remove any existing arguments with the same key (except the desired one)
         while IFS= read -r line; do
             [[ "$line" == "$key="* ]] || continue
             [[ "$line" == "$karg" ]] && continue
@@ -244,7 +242,6 @@ run_sleep_stage() {
             changed=1
         done <<< "$current"
 
-        # Add the desired argument if missing
         if [[ "$current" != *"$karg"* ]]; then
             rpm-ostree kargs --append-if-missing="$karg" &>/dev/null || return 1
             changed=1
@@ -264,36 +261,55 @@ run_sleep_stage() {
 # -----------------------------------------------------------------------------
 # Stage: Fingerprint sensor tweaks
 # -----------------------------------------------------------------------------
+# Non-critical stage: if the reader is not present or its controller cannot
+# be located, the stage is reported as an error (with reason on the next line)
+# but does not stop the script.
+# -----------------------------------------------------------------------------
 run_fingerprint_stage() {
+    if ! lsusb -d "${FP_VENDOR}:${FP_PRODUCT}" &>/dev/null; then
+        FP_FAIL_REASON="Fingerprint reader not found."
+        return 1
+    fi
+
+    local controller
+    if ! controller=$(find_fp_controller); then
+        FP_FAIL_REASON="Fingerprint controller not found."
+        return 1
+    fi
+
     local changed=0
-    local wake="/sys/bus/pci/devices/${FP_CONTROLLER}/power/wakeup"
+    local wake="/sys/bus/pci/devices/${controller}/power/wakeup"
 
-    [[ -f "$wake" ]] || return 1
+    if [[ ! -f "$wake" ]]; then
+        FP_FAIL_REASON="Fingerprint wake path not accessible."
+        return 1
+    fi
 
-    # 1. Runtime PME disable
     local current
     current=$(cat "$wake" 2>/dev/null || echo "")
     if [[ "$current" != "disabled" ]]; then
-        echo "disabled" | tee "$wake" >/dev/null || return 1
+        echo "disabled" | tee "$wake" >/dev/null || { FP_FAIL_REASON="Failed to disable PME."; return 1; }
         changed=1
     fi
 
-    # 2. Udev rule (persist across reboots)
     local need_update=1
     if [[ -f "$FP_UDEV_RULE" ]]; then
-        grep -q "KERNEL==\"$FP_CONTROLLER\"" "$FP_UDEV_RULE" && need_update=0
+        grep -q "KERNEL==\"$controller\"" "$FP_UDEV_RULE" && need_update=0
     fi
     if [[ $need_update -eq 1 ]]; then
-        printf "$FP_UDEV_CONTENT" "$FP_CONTROLLER" > "$FP_UDEV_RULE" || return 1
-        udevadm control --reload-rules || return 1
+        printf "$FP_UDEV_CONTENT" "$controller" > "$FP_UDEV_RULE" \
+            || { FP_FAIL_REASON="Failed to write udev rule."; return 1; }
+        udevadm control --reload-rules \
+            || { FP_FAIL_REASON="Failed to reload udev rules."; return 1; }
         changed=1
     fi
 
-    # 3. GPIO kernel argument
     local kargs
-    kargs=$(rpm-ostree kargs 2>/dev/null) || return 1
+    kargs=$(rpm-ostree kargs 2>/dev/null) \
+        || { FP_FAIL_REASON="Failed to read kernel arguments."; return 1; }
     if [[ "$kargs" != *"$FP_KARG"* ]]; then
-        rpm-ostree kargs --append-if-missing="$FP_KARG" &>/dev/null || return 1
+        rpm-ostree kargs --append-if-missing="$FP_KARG" &>/dev/null \
+            || { FP_FAIL_REASON="Failed to add GPIO kernel argument."; return 1; }
         changed=1
         reboot_needed=1
     fi
@@ -329,7 +345,6 @@ run_gamemode_stage() {
         fi
     fi
 
-    # Skip if source or Desktop folder is missing
     if [[ ! -d "$desktop_dir" || ! -f "$GAMEMODE_DESKTOP_SRC" ]]; then
         print_status "Gamemode shortcut" "exists"
         return 0
@@ -361,7 +376,6 @@ run_gamemode_stage() {
 run_hhd_stage() {
     command -v hhdctl &>/dev/null || return 1
 
-    # Reset all settings, wait, then apply preset
     hhdctl set hhd.settings.reset=true &>/dev/null || return 1
     sleep "$HHD_RESET_DELAY"
 
@@ -379,29 +393,52 @@ run_hhd_stage() {
 # -----------------------------------------------------------------------------
 if prepare; then
     print_status "Preparation" "done"
+    stages_ok=$((stages_ok + 1))
 else
-    print_status "Preparation" "error"
+    print_status "Preparation" "error" "$PREP_FAIL_REASON"
+    echo -e "${RED}All fixes failed to install.${NC}"
     exit 1
 fi
 
-if ! run_sleep_stage; then
+if run_sleep_stage; then
+    stages_ok=$((stages_ok + 1))
+else
     print_status "Sleep fix" "error"
+    stages_error=$((stages_error + 1))
 fi
 
-if ! run_fingerprint_stage; then
-    print_status "Fingerprint sensor tweaks" "error"
+if run_fingerprint_stage; then
+    stages_ok=$((stages_ok + 1))
+else
+    print_status "Fingerprint sensor tweaks" "error" "$FP_FAIL_REASON"
+    stages_error=$((stages_error + 1))
 fi
 
-if ! run_gamemode_stage; then
+if run_gamemode_stage; then
+    stages_ok=$((stages_ok + 1))
+else
     print_status "Gamemode shortcut" "error"
+    stages_error=$((stages_error + 1))
 fi
 
-if ! run_hhd_stage; then
+if run_hhd_stage; then
+    stages_ok=$((stages_ok + 1))
+else
     print_status "HHD settings" "error"
+    stages_error=$((stages_error + 1))
 fi
 
-# Readiness
-print_status "Readiness" "done"
+# -----------------------------------------------------------------------------
+# Final report
+# -----------------------------------------------------------------------------
+if [[ $stages_error -eq 0 ]]; then
+    echo -e "${GREEN}All fixes installed successfully.${NC}"
+elif [[ $stages_ok -eq 1 ]]; then
+    echo -e "${RED}All fixes failed to install.${NC}"
+else
+    echo -e "${YELLOW}Completed with errors.${NC}"
+fi
+
 if [[ $reboot_needed -eq 1 ]]; then
     echo -e "${YELLOW}Reboot required for kernel arguments to take effect.${NC}"
 fi
