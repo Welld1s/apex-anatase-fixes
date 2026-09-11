@@ -26,9 +26,9 @@ The script is **idempotent** – running it multiple times won't make unnecessar
 
 - Hardware: **OneXPlayer Apex**
 - OS: **Anatase OS** version **20260907.10** or newer
+- **HHD** (comes with Anatase OS; if absent, the HHD stage is skipped)
 - **root** privileges (the script will request sudo automatically)
 - Internet connection
-- **HHD** (comes with Anatase OS; if absent, the HHD stage is skipped)
 
 ## 🚀 Installation and Usage
 
