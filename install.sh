@@ -26,11 +26,12 @@ SCRIPT_VERSION="1.3.0"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
-# Auto-elevate to root if not already
+# Auto-elevate to root if not already, preserving graphical session variables
+# so the Steam launcher can find the display server later.
 # -----------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
     echo "Requesting root privileges..."
-    exec sudo "$0" "$@"
+    exec sudo --preserve-env=DISPLAY,WAYLAND_DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR "$0" "$@"
 fi
 
 # -----------------------------------------------------------------------------
@@ -141,9 +142,6 @@ get_real_home() {
     eval echo "~$user"
 }
 
-# Run a command in the real user's graphical session context.
-# Used for lightweight tools (xprop, kwriteconfig6, busctl) that only need
-# DISPLAY/WAYLAND_DISPLAY and the session D-Bus address.
 steam_as_user() {
     local user home uid
     user=$(get_real_user)
@@ -160,7 +158,6 @@ steam_as_user() {
         "$@"
 }
 
-# Call a D-Bus method on the user's KWin instance using busctl.
 kwin_call() {
     local user home uid
     user=$(get_real_user)
@@ -515,9 +512,10 @@ run_steam_stage() {
     fi
 
     # ---- 3. Launch Steam if not running -------------------------------------
-    # The full Exec= line is taken from the .desktop file verbatim, with no
-    # modification. `su -` creates a full login session (PAM + profile),
-    # which is what Flatpak's portal lookup actually requires.
+    # Full Exec= line taken from the .desktop file verbatim.
+    # `su -` gives a login session (needed for flatpak-portal), and the
+    # graphical session variables are re-exported explicitly because `su -`
+    # resets the environment.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
         echo "Launching Steam (this may take a while)..."
 
@@ -529,7 +527,15 @@ run_steam_stage() {
             return 1
         fi
 
-        su - "$user" -c "setsid $exec_line >/dev/null 2>&1 < /dev/null &"
+        su - "$user" -c "
+            export DISPLAY='$DISPLAY' \
+                   WAYLAND_DISPLAY='$WAYLAND_DISPLAY' \
+                   XDG_RUNTIME_DIR='/run/user/$uid' \
+                   DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/$uid/bus' \
+                   XAUTHORITY='$home/.Xauthority' \
+                   XDG_CURRENT_DESKTOP='KDE'
+            setsid $exec_line >/dev/null 2>&1 < /dev/null &
+        "
 
         for _ in $(seq 1 60); do
             sleep 1
