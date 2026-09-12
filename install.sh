@@ -22,16 +22,59 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Script metadata
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.0-1"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
 # Auto-elevate to root if not already, preserving graphical session variables
 # so the Steam launcher can find the display server later.
+#
+# If a password is required but we have no terminal to prompt on, sudo would
+# hang forever — bail out with a clear message instead.
 # -----------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
     echo "Requesting root privileges..."
-    exec sudo --preserve-env=DISPLAY,WAYLAND_DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR "$0" "$@"
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "sudo not found. Please re-run this script as root." >&2
+        exit 1
+    fi
+
+    SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]:-$0}")
+    if [[ ! -f "$SCRIPT_PATH" ]]; then
+        echo "Cannot locate script file: ${BASH_SOURCE[0]:-$0}" >&2
+        exit 1
+    fi
+
+    if sudo -n true 2>/dev/null; then
+        # Passwordless sudo — run silently.
+        if ! sudo -n \
+                DISPLAY="${DISPLAY:-}" \
+                WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+                XAUTHORITY="${XAUTHORITY:-}" \
+                XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+                -- "$SCRIPT_PATH" "$@"; then
+            echo "Failed to elevate to root." >&2
+            exit 1
+        fi
+    elif [[ -t 0 && -t 1 ]]; then
+        # Interactive terminal — plain sudo, prompts for password.
+        if ! sudo \
+                DISPLAY="${DISPLAY:-}" \
+                WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+                XAUTHORITY="${XAUTHORITY:-}" \
+                XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+                -- "$SCRIPT_PATH" "$@"; then
+            echo "Failed to elevate to root." >&2
+            exit 1
+        fi
+    else
+        echo "Cannot prompt for a password: no terminal attached." >&2
+        echo "Please run this script from a terminal, or as root." >&2
+        exit 1
+    fi
+
+    exit 0
 fi
 
 # -----------------------------------------------------------------------------
