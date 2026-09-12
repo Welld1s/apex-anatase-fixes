@@ -162,17 +162,18 @@ steam_as_user() {
 }
 
 # Launch a graphical application in the user's *systemd user session*.
-# systemd-run --user starts the command as a transient unit inside the
-# user's session scope, which is where flatpak-portal lives. This is the
-# reliable way to launch Flatpak apps from a root script.
+# systemd-run --user creates a transient *service* inside the user's session
+# scope, which is where flatpak-portal lives. Unlike --scope, the service is
+# independent of the caller and survives its exit.
 user_session_run() {
     local user uid
     user=$(get_real_user)
     uid=$(id -u "$user")
     sudo -u "$user" env \
         XDG_RUNTIME_DIR="/run/user/$uid" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-        systemd-run --user --scope --quiet "$@"
+        systemd-run --user --collect \
+            --unit="apex-launch-$$-$RANDOM" \
+            "$@"
 }
 
 # Call a D-Bus method on the user's KWin instance using busctl.
@@ -394,7 +395,6 @@ run_hhd_stage() {
 # Steam helpers
 # -----------------------------------------------------------------------------
 
-# Find the Steam on-screen keyboard window using xprop only.
 find_steam_keyboard_window() {
     local win_list win
     win_list=$(steam_as_user xprop -root _NET_CLIENT_LIST 2>/dev/null \
@@ -429,7 +429,6 @@ find_steam_keyboard_window() {
     return 1
 }
 
-# Close a window by its exact caption using KWin's D-Bus scripting interface.
 close_window_by_caption() {
     local title="$1"
 
@@ -459,7 +458,6 @@ EOF
     return 0
 }
 
-# Ensure ~/.config/kwinrc has XwaylandEisNoPromptApps containing "steam".
 steam_ensure_kwinrc() {
     local user home kwinrc current_val new_val
     user=$(get_real_user)
@@ -537,17 +535,34 @@ run_steam_stage() {
     fi
 
     # ---- 3. Launch Steam if not running -------------------------------------
-    # Launch via systemd-run --user so the process lives inside the user's
-    # systemd session scope, where flatpak-portal is available. Plain sudo -u
-    # is not enough: it detaches from the session bus Flatpak requires.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
         echo "Launching Steam (this may take a while)..."
-        user_session_run gtk-launch "$STEAM_DESKTOP_ID" &>/dev/null &
 
-        for _ in $(seq 1 60); do
+        user_session_run gtk-launch "$STEAM_DESKTOP_ID" &>/dev/null || true
+
+        for _ in $(seq 1 30); do
             sleep 1
             pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
         done
+
+        # Fallback: extract Exec= and invoke it directly through the
+        # user's systemd session.
+        if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
+            echo "Primary launch failed, trying Exec= fallback..."
+
+            local exec_line
+            exec_line=$(grep -E '^Exec=' "$STEAM_DESKTOP_SRC" | head -1 | cut -d= -f2-)
+            exec_line=$(printf '%s' "$exec_line" | sed -E 's/ *(@@[a-zA-Z]?|%[a-zA-Z])//g')
+
+            if [[ -n "$exec_line" ]]; then
+                user_session_run sh -c "$exec_line" &>/dev/null || true
+                for _ in $(seq 1 30); do
+                    sleep 1
+                    pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
+                done
+            fi
+        fi
+
         sleep 5
     fi
 
