@@ -94,7 +94,6 @@ HHD_SETTINGS=(
 
 # Steam setup
 STEAM_DESKTOP_SRC="/var/lib/flatpak/exports/share/applications/org.anatase.Steam.Silent.desktop"
-STEAM_DESKTOP_ID="org.anatase.Steam.Silent"
 STEAM_DESKTOP_NAME="org.anatase.Steam.Silent.desktop"
 STEAM_RULE_UUID="94ba89ad-c6f6-41ba-9d44-4113517758ff"
 
@@ -159,21 +158,6 @@ steam_as_user() {
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
         XDG_CURRENT_DESKTOP="KDE" \
         "$@"
-}
-
-# Launch a graphical application in the user's *systemd user session*.
-# systemd-run --user creates a transient *service* inside the user's session
-# scope, which is where flatpak-portal lives. Unlike --scope, the service is
-# independent of the caller and survives its exit.
-user_session_run() {
-    local user uid
-    user=$(get_real_user)
-    uid=$(id -u "$user")
-    sudo -u "$user" env \
-        XDG_RUNTIME_DIR="/run/user/$uid" \
-        systemd-run --user --collect \
-            --unit="apex-launch-$$-$RANDOM" \
-            "$@"
 }
 
 # Call a D-Bus method on the user's KWin instance using busctl.
@@ -507,10 +491,6 @@ run_steam_stage() {
         STEAM_FAIL_REASON="kwriteconfig6 is not installed."
         return 1
     fi
-    if ! command -v systemd-run >/dev/null 2>&1; then
-        STEAM_FAIL_REASON="systemd-run is not installed."
-        return 1
-    fi
 
     local changed=0
 
@@ -535,34 +515,26 @@ run_steam_stage() {
     fi
 
     # ---- 3. Launch Steam if not running -------------------------------------
+    # The full Exec= line is taken from the .desktop file verbatim, with no
+    # modification. `su -` creates a full login session (PAM + profile),
+    # which is what Flatpak's portal lookup actually requires.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
         echo "Launching Steam (this may take a while)..."
 
-        user_session_run gtk-launch "$STEAM_DESKTOP_ID" &>/dev/null || true
+        local exec_line
+        exec_line=$(grep -E '^Exec=' "$STEAM_DESKTOP_SRC" | head -1 | cut -d= -f2-)
 
-        for _ in $(seq 1 30); do
+        if [[ -z "$exec_line" ]]; then
+            STEAM_FAIL_REASON="Could not read Exec= from $STEAM_DESKTOP_SRC"
+            return 1
+        fi
+
+        su - "$user" -c "setsid $exec_line >/dev/null 2>&1 < /dev/null &"
+
+        for _ in $(seq 1 60); do
             sleep 1
             pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
         done
-
-        # Fallback: extract Exec= and invoke it directly through the
-        # user's systemd session.
-        if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
-            echo "Primary launch failed, trying Exec= fallback..."
-
-            local exec_line
-            exec_line=$(grep -E '^Exec=' "$STEAM_DESKTOP_SRC" | head -1 | cut -d= -f2-)
-            exec_line=$(printf '%s' "$exec_line" | sed -E 's/ *(@@[a-zA-Z]?|%[a-zA-Z])//g')
-
-            if [[ -n "$exec_line" ]]; then
-                user_session_run sh -c "$exec_line" &>/dev/null || true
-                for _ in $(seq 1 30); do
-                    sleep 1
-                    pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
-                done
-            fi
-        fi
-
         sleep 5
     fi
 
