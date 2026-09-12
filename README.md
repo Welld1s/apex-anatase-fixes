@@ -10,13 +10,18 @@ The script is **not endorsed** by the Anatase OS development team. Use it at you
 
 ## 📌 What this script does
 
-The script applies the following stages, each reported with its own status (`done`, `exists`, or `error`):
+The script applies the following stages, each reported with its own status (`done`, `not needed`, or `error`):
 
 - **Fingerprint sensor tweaks** — A light touch on the power button's fingerprint sensor would wake the device from sleep, which is annoying when carrying it in a bag. The script disables this via two paths: the PCIe PME wake of the reader's xHCI controller (runtime + persistent udev rule) and the GPIO wake line (`gpiolib_acpi.ignore_wake` kernel argument).
 
-- **Gamemode shortcut** — Copies `/usr/share/applications/gamemode.desktop` to the user's Desktop folder (supports localized Desktop folder names).
+- **Gamemode shortcut** — Copies `/usr/share/applications/gamemode.desktop` to the user's Desktop folder for quick access.
 
-- **HHD settings** — Applies a curated Handheld Daemon preset: custom TDP (55 W), manual fan curve, AMD energy mode, RGB (cyberpunk), OXP controller mode with `hori_steam` layout, vibration strength, GameMode behaviour and power/battery configuration. All settings are applied via `hhdctl set` after a full `hhd.settings.reset`.
+- **HHD settings** — Applies a curated Handheld Daemon preset: custom TDP (55 W), manual fan curve, AMD energy mode, RGB (cyberpunk), OXP controller mode with `hori_steam` layout, vibration strength, GameMode behaviour and power/battery configuration. All settings are applied via `hhdctl set` after a full `hhd.settings.reset` (settings reset). Before applying anything, the script reads the current HHD configuration and skips this stage entirely if every parameter already matches — so a second run does no work and does not reset your HHD settings.
+
+- **Steam setup** — Configures Steam (Flatpak) for a seamless handheld experience:
+  - copies the *Silent* Steam autostart entry to `~/.config/autostart` so the client starts quietly with the Desktop session;
+  - adds `steam` to `XwaylandEisNoPromptApps` in `kwinrc` so the system stops prompting about Xwayland gamepad/EIS access;
+  - launches Steam if it is not running, opens the on-screen keyboard window once to capture its exact title, closes it, and writes a KWin window rule that pins the keyboard to the bottom of the screen with correct scaling and transparency settings.
 
 The script is **idempotent** – running it multiple times won't make unnecessary changes.
 
@@ -40,7 +45,7 @@ The script will prompt for your `sudo` password if needed. Each stage prints its
 
 ## ⚠️ Important Notes
 
-- **A reboot is required** if the fingerprint GPIO kernel argument was added. The script will tell you at the end.
+- **A reboot is required** if the fingerprint GPIO kernel argument was added, or if the `kwinrc` Xwayland entry was changed for the first time. The script will tell you at the end.
 
 - **BIOS setting** — when the fingerprint sensor tweaks stage adds the GPIO kernel argument, enter the BIOS (usually by pressing `Del` during boot) and set: `Advanced -> ACPI Settings -> Enable ACPI Auto Configuration` -> **Enabled**. This is necessary for proper suspend/resume behavior.
 
