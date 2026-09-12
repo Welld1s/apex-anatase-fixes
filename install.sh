@@ -11,7 +11,8 @@ set -euo pipefail
 #     Fingerprint sensor tweaks - PME disable + udev rule + GPIO kernel arg
 #     Gamemode shortcut        - copy .desktop to user's Desktop
 #     HHD settings             - apply curated HHD preset
-#     Steam setup              - silent autostart, kwinrc tweak, window rule
+#     Steam setup              - silent autostart, kwinrc gamepad fix,
+#                                keyboard window rule
 #
 #   The script is idempotent: it checks current state before making changes.
 #
@@ -153,6 +154,19 @@ steam_as_user() {
         WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
         XDG_RUNTIME_DIR="/run/user/$uid" \
         "$@"
+}
+
+# Call a D-Bus method on the user's KWin instance using busctl.
+# Usage: kwin_call <object_path> <interface> <method> [signature args...]
+kwin_call() {
+    local user home uid
+    user=$(get_real_user)
+    home=$(get_real_home)
+    uid=$(id -u "$user")
+    sudo -u "$user" env \
+        HOME="$home" \
+        XDG_RUNTIME_DIR="/run/user/$uid" \
+        busctl --user --quiet call org.kde.KWin "$@" 2>/dev/null || true
 }
 
 # -----------------------------------------------------------------------------
@@ -404,37 +418,18 @@ find_steam_keyboard_window() {
 # the window, so no external tools (xdotool, wmctrl) are required.
 close_window_by_caption() {
     local title="$1"
-    local user home uid
-    user=$(get_real_user)
-    home=$(get_real_home)
-    uid=$(id -u "$user")
-
-    # Prefer qdbus6 (Plasma 6), fall back to qdbus (Plasma 5)
-    local qdbus_bin=""
-    for bin in qdbus6 qdbus; do
-        if command -v "$bin" >/dev/null 2>&1; then
-            qdbus_bin="$bin"; break
-        fi
-    done
-    if [[ -z "$qdbus_bin" ]]; then
-        return 1
-    fi
 
     # Escape the title for safe embedding in a JS string
     local escaped_title
     escaped_title=$(printf '%s' "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
-    # KWin script: iterate over windows, close the one whose caption matches.
-    # API differs between KWin 5 (clientList) and KWin 6 (windowList).
+    # KWin 6 script: iterate over windows, close the one whose caption matches.
     local script_name="apex-close-keyboard-$$"
     local script_file="/tmp/${script_name}.js"
     cat > "$script_file" << EOF
 (function () {
     const target = "${escaped_title}";
-    const list = (typeof workspace.windowList === "function")
-        ? workspace.windowList()
-        : workspace.clientList();
-    for (const w of list) {
+    for (const w of workspace.windowList()) {
         if (w.caption === target) {
             w.closeWindow();
         }
@@ -443,25 +438,10 @@ close_window_by_caption() {
 EOF
     chmod 644 "$script_file"
 
-    sudo -u "$user" env \
-        HOME="$home" \
-        XDG_RUNTIME_DIR="/run/user/$uid" \
-        "$qdbus_bin" org.kde.KWin /Scripting \
-        org.kde.kwin.Scripting.loadScript "$script_file" >/dev/null 2>&1 || true
-
-    sudo -u "$user" env \
-        HOME="$home" \
-        XDG_RUNTIME_DIR="/run/user/$uid" \
-        "$qdbus_bin" org.kde.KWin /Scripting \
-        org.kde.kwin.Scripting.start >/dev/null 2>&1 || true
-
+    kwin_call /Scripting org.kde.kwin.Scripting loadScript s "$script_file"
+    kwin_call /Scripting org.kde.kwin.Scripting start
     sleep 0.5
-
-    sudo -u "$user" env \
-        HOME="$home" \
-        XDG_RUNTIME_DIR="/run/user/$uid" \
-        "$qdbus_bin" org.kde.KWin /Scripting \
-        org.kde.kwin.Scripting.unloadScript "$script_name" >/dev/null 2>&1 || true
+    kwin_call /Scripting org.kde.kwin.Scripting unloadScript s "$script_name"
 
     rm -f "$script_file"
     return 0
@@ -491,29 +471,9 @@ steam_ensure_kwinrc() {
         new_val="${current_val},steam"
     fi
 
-    if command -v kwriteconfig6 >/dev/null 2>&1; then
-        steam_as_user kwriteconfig6 --file kwinrc --group Xwayland \
-            --key XwaylandEisNoPromptApps "$new_val" 2>/dev/null || true
-    elif command -v kwriteconfig5 >/dev/null 2>&1; then
-        steam_as_user kwriteconfig5 --file kwinrc --group Xwayland \
-            --key XwaylandEisNoPromptApps "$new_val" 2>/dev/null || true
-    else
-        if [[ ! -f "$kwinrc" ]]; then
-            printf '[Xwayland]\nXwaylandEisNoPromptApps=%s\n' "$new_val" \
-                | sudo -u "$user" tee "$kwinrc" >/dev/null
-        elif grep -q '^\[Xwayland\]' "$kwinrc"; then
-            if grep -q '^XwaylandEisNoPromptApps=' "$kwinrc"; then
-                sudo -u "$user" sed -i \
-                    "s|^XwaylandEisNoPromptApps=.*|XwaylandEisNoPromptApps=$new_val|" "$kwinrc"
-            else
-                sudo -u "$user" sed -i \
-                    '/^\[Xwayland\]/a XwaylandEisNoPromptApps='"$new_val" "$kwinrc"
-            fi
-        else
-            printf '\n[Xwayland]\nXwaylandEisNoPromptApps=%s\n' "$new_val" \
-                | sudo -u "$user" tee -a "$kwinrc" >/dev/null
-        fi
-    fi
+    steam_as_user kwriteconfig6 --file kwinrc --group Xwayland \
+        --key XwaylandEisNoPromptApps "$new_val" 2>/dev/null || true
+
     return 0
 }
 
@@ -530,8 +490,12 @@ run_steam_stage() {
         STEAM_FAIL_REASON="xprop is not installed."
         return 1
     fi
-    if ! command -v qdbus6 >/dev/null 2>&1 && ! command -v qdbus >/dev/null 2>&1; then
-        STEAM_FAIL_REASON="qdbus is not installed (needed to close the keyboard window)."
+    if ! command -v busctl >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="busctl is not installed."
+        return 1
+    fi
+    if ! command -v kwriteconfig6 >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="kwriteconfig6 is not installed."
         return 1
     fi
 
@@ -552,8 +516,12 @@ run_steam_stage() {
     fi
 
     # ---- 2. kwinrc Xwayland entry -------------------------------------------
+    # Adds "steam" to XwaylandEisNoPromptApps. This is required for the
+    # gamepad to work correctly in desktop mode; the change only takes
+    # effect after a reboot.
     if steam_ensure_kwinrc; then
         changed=1
+        reboot_needed=1
     fi
 
     # ---- 3. Launch Steam if not running -------------------------------------
@@ -597,53 +565,42 @@ run_steam_stage() {
     close_window_by_caption "$title" || true
 
     # ---- 6. Write KWin window rule ------------------------------------------
-    local kc=""
-    if command -v kwriteconfig6 >/dev/null 2>&1; then
-        kc=kwriteconfig6
-    elif command -v kwriteconfig5 >/dev/null 2>&1; then
-        kc=kwriteconfig5
-    else
-        STEAM_FAIL_REASON="kwriteconfig not found."
-        return 1
-    fi
-    local krc="${kc/kwriteconfig/kreadconfig}"
-
     local existing_title
-    existing_title=$(steam_as_user "$krc" --file kwinrulesrc \
+    existing_title=$(steam_as_user kreadconfig6 --file kwinrulesrc \
         --group "$STEAM_RULE_UUID" --key title --default "" 2>/dev/null || echo "")
 
     if [[ "$existing_title" != "$title" ]]; then
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key Description "Window settings for Steam Keyboard"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key above "true"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key aboverule "2"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key ignoregeometry "true"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key ignoregeometryrule "2"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key maximizehoriz "true"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key maximizehorizrule "2"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityinactive "75"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityinactiverule "2"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key position "0,238"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key positionrule "2"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key skiptaskbar "true"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key skiptaskbarrule "2"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key title "$title"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key titlematch "2"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclass "steam"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclasscomplete "true"
-        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclassmatch "2"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key Description "Window settings for Steam Keyboard"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key above "true"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key aboverule "2"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key ignoregeometry "true"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key ignoregeometryrule "2"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key maximizehoriz "true"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key maximizehorizrule "2"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityinactive "75"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityinactiverule "2"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key position "0,238"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key positionrule "2"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key skiptaskbar "true"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key skiptaskbarrule "2"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key title "$title"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key titlematch "2"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclass "steam"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclasscomplete "true"
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclassmatch "2"
 
         local rules
-        rules=$(steam_as_user "$krc" --file kwinrulesrc --group General \
+        rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
             --key rules --default "" 2>/dev/null || echo "")
         if [[ ",$rules," != *",$STEAM_RULE_UUID,"* ]]; then
             if [[ -z "$rules" ]]; then
-                steam_as_user "$kc" --file kwinrulesrc --group General --key rules "$STEAM_RULE_UUID"
+                steam_as_user kwriteconfig6 --file kwinrulesrc --group General --key rules "$STEAM_RULE_UUID"
             else
-                steam_as_user "$kc" --file kwinrulesrc --group General --key rules "${rules},${STEAM_RULE_UUID}"
+                steam_as_user kwriteconfig6 --file kwinrulesrc --group General --key rules "${rules},${STEAM_RULE_UUID}"
             fi
         fi
 
-        steam_as_user qdbus org.kde.KWin /KWin reconfigure 2>/dev/null || true
+        kwin_call /KWin org.kde.KWin reconfigure
 
         changed=1
     fi
@@ -708,7 +665,7 @@ else
 fi
 
 if [[ $reboot_needed -eq 1 ]]; then
-    echo -e "${YELLOW}Reboot required for kernel arguments to take effect.${NC}"
+    echo -e "${YELLOW}Reboot required to apply some fixes.${NC}"
 fi
 if [[ $bios_needed -eq 1 ]]; then
     echo -e "${YELLOW}Also, ensure BIOS setting: Advanced -> ACPI Settings -> Enable ACPI Auto Configuration -> Enabled${NC}"
