@@ -7,20 +7,21 @@ set -euo pipefail
 # Description:
 #   Applies all known fixes for OneXPlayer Apex running Anatase OS.
 #   Stages:
-#     Preparation               - validate OS, version, hardware
+#     Preparation              - validate OS, version, hardware
 #     Fingerprint sensor tweaks - PME disable + udev rule + GPIO kernel arg
-#     Gamemode shortcut         - copy .desktop to user's Desktop
-#     HHD settings              - apply curated HHD preset
+#     Gamemode shortcut        - copy .desktop to user's Desktop
+#     HHD settings             - apply curated HHD preset
+#     Steam setup              - silent autostart, kwinrc tweak, window rule
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.2.0
+# Version: 1.3.0
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Script metadata
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
@@ -43,11 +44,9 @@ NC='\033[0m'
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-# Hardware identification (DMI)
 EXPECTED_BOARD_VENDOR="ONE-NETBOOK"
 EXPECTED_BOARD_NAME="ONEXPLAYER APEX"
 
-# Fingerprint reader (FocalTech)
 FP_VENDOR="2808"
 FP_PRODUCT="c652"
 FP_KARG="gpiolib_acpi.ignore_wake=AMDI0030:00@58"
@@ -57,14 +56,11 @@ FP_UDEV_CONTENT='# Block wake from the xHCI controller hosting the FocalTech fin
 ACTION=="add", SUBSYSTEM=="pci", KERNEL=="%s", ATTR{power/wakeup}="disabled"
 '
 
-# GameMode desktop shortcut
 GAMEMODE_DESKTOP_SRC="/usr/share/applications/gamemode.desktop"
 GAMEMODE_DESKTOP_NAME="gamemode.desktop"
 
-# Minimum required Anatase OS version
 MIN_ANATASE_VERSION="20260907.10"
 
-# HHD settings preset
 HHD_RESET_DELAY=5
 HHD_SETTINGS=(
     "tdp.unified.tdp.mode=custom"
@@ -95,6 +91,11 @@ HHD_SETTINGS=(
     "gamemode.battery.charge_bypass=awake"
 )
 
+# Steam setup
+STEAM_DESKTOP_SRC="/var/lib/flatpak/exports/share/applications/org.anatase.Steam.Silent.desktop"
+STEAM_DESKTOP_NAME="org.anatase.Steam.Silent.desktop"
+STEAM_RULE_UUID="94ba89ad-c6f6-41ba-9d44-4113517758ff"
+
 # -----------------------------------------------------------------------------
 # State
 # -----------------------------------------------------------------------------
@@ -106,6 +107,7 @@ stages_error=0
 
 PREP_FAIL_REASON=""
 FP_FAIL_REASON=""
+STEAM_FAIL_REASON=""
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -115,9 +117,9 @@ print_status() {
     local stage="$1" status="$2" reason="${3:-}"
     local color
     case "$status" in
-        done|exists) color="$GREEN" ;;
-        error)       color="$RED" ;;
-        *)           color="$NC" ;;
+        done|"not needed") color="$GREEN" ;;
+        error)             color="$RED" ;;
+        *)                 color="$NC" ;;
     esac
     printf "${WHITE}%s${NC} - ${color}%s${NC}\n" "$stage" "$status"
     if [[ -n "$reason" ]]; then
@@ -137,6 +139,20 @@ get_real_home() {
     local user
     user=$(get_real_user)
     eval echo "~$user"
+}
+
+# Run a command in the real user's graphical session environment.
+steam_as_user() {
+    local user home uid
+    user=$(get_real_user)
+    home=$(get_real_home)
+    uid=$(id -u "$user")
+    sudo -u "$user" env \
+        HOME="$home" \
+        DISPLAY="${DISPLAY:-:0}" \
+        WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+        XDG_RUNTIME_DIR="/run/user/$uid" \
+        "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -168,7 +184,6 @@ find_fp_controller() {
 # Stage: Preparation (hard gate — exits on failure)
 # -----------------------------------------------------------------------------
 prepare() {
-    # OS check
     if [[ ! -f /etc/os-release ]]; then
         PREP_FAIL_REASON="Anatase OS not detected."
         return 1
@@ -179,7 +194,6 @@ prepare() {
         return 1
     fi
 
-    # Version check
     if ! command -v bootc &>/dev/null; then
         PREP_FAIL_REASON="bootc not found."
         return 1
@@ -199,7 +213,6 @@ prepare() {
         return 1
     fi
 
-    # Hardware check (DMI only – fingerprint reader is non-critical)
     local vendor name
     if ! vendor=$(cat /sys/class/dmi/id/board_vendor 2>/dev/null); then
         PREP_FAIL_REASON="Cannot read DMI information."
@@ -219,10 +232,6 @@ prepare() {
 
 # -----------------------------------------------------------------------------
 # Stage: Fingerprint sensor tweaks
-# -----------------------------------------------------------------------------
-# Non-critical stage: if the reader is not present or its controller cannot
-# be located, the stage is reported as an error (with reason on the next line)
-# but does not stop the script.
 # -----------------------------------------------------------------------------
 run_fingerprint_stage() {
     if ! lsusb -d "${FP_VENDOR}:${FP_PRODUCT}" &>/dev/null; then
@@ -277,13 +286,13 @@ run_fingerprint_stage() {
     if [[ $changed -eq 1 ]]; then
         print_status "Fingerprint sensor tweaks" "done"
     else
-        print_status "Fingerprint sensor tweaks" "exists"
+        print_status "Fingerprint sensor tweaks" "not needed"
     fi
     return 0
 }
 
 # -----------------------------------------------------------------------------
-# Stage: Gamemode shortcut (supports localized Desktop folder names)
+# Stage: Gamemode shortcut
 # -----------------------------------------------------------------------------
 run_gamemode_stage() {
     local user home desktop_dir user_dirs raw_dir dest
@@ -306,7 +315,7 @@ run_gamemode_stage() {
     fi
 
     if [[ ! -d "$desktop_dir" || ! -f "$GAMEMODE_DESKTOP_SRC" ]]; then
-        print_status "Gamemode shortcut" "exists"
+        print_status "Gamemode shortcut" "not needed"
         return 0
     fi
 
@@ -325,7 +334,7 @@ run_gamemode_stage() {
         chmod +x "$dest" || return 1
         print_status "Gamemode shortcut" "done"
     else
-        print_status "Gamemode shortcut" "exists"
+        print_status "Gamemode shortcut" "not needed"
     fi
     return 0
 }
@@ -345,6 +354,305 @@ run_hhd_stage() {
     done
 
     print_status "HHD settings" "done"
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Steam helpers
+# -----------------------------------------------------------------------------
+
+# Find the Steam on-screen keyboard window using xprop only.
+# Identified by combining WM_CLASS, window type and KDE user-creation time.
+find_steam_keyboard_window() {
+    local win_list win
+    win_list=$(steam_as_user xprop -root _NET_CLIENT_LIST 2>/dev/null \
+               | sed 's/.*# //' | tr ',' '\n' | tr -d ' ')
+
+    for win in $win_list; do
+        [[ -n "$win" ]] || continue
+
+        local wmclass
+        wmclass=$(steam_as_user xprop -id "$win" WM_CLASS 2>/dev/null \
+                  | sed 's/^[^=]*= //' | tr -d '"')
+        case "$wmclass" in
+            "steamwebhelper, steam"|"steamwebhelper, steamwebhelper") ;;
+            *) continue ;;
+        esac
+
+        local wmtype
+        wmtype=$(steam_as_user xprop -id "$win" _NET_WM_WINDOW_TYPE 2>/dev/null)
+        case "$wmtype" in
+            *"_NET_WM_WINDOW_TYPE_UTILITY"*) ;;
+            *) continue ;;
+        esac
+
+        # _KDE_NET_WM_USER_CREATION_TIME is a millisecond counter from
+        # X server start, not an epoch date. We only check presence and non-zero.
+        local ct
+        ct=$(steam_as_user xprop -id "$win" _KDE_NET_WM_USER_CREATION_TIME 2>/dev/null \
+             | awk -F'= ' '{print $2}' | tr -d ' ')
+        [[ -n "$ct" && "$ct" != "0" ]] || continue
+
+        echo "$win"
+        return 0
+    done
+    return 1
+}
+
+# Close a window by its exact caption using KWin's D-Bus scripting interface.
+# This is a system-native equivalent of WM_DELETE_WINDOW: KWin itself closes
+# the window, so no external tools (xdotool, wmctrl) are required.
+close_window_by_caption() {
+    local title="$1"
+    local user home uid
+    user=$(get_real_user)
+    home=$(get_real_home)
+    uid=$(id -u "$user")
+
+    # Prefer qdbus6 (Plasma 6), fall back to qdbus (Plasma 5)
+    local qdbus_bin=""
+    for bin in qdbus6 qdbus; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            qdbus_bin="$bin"; break
+        fi
+    done
+    if [[ -z "$qdbus_bin" ]]; then
+        return 1
+    fi
+
+    # Escape the title for safe embedding in a JS string
+    local escaped_title
+    escaped_title=$(printf '%s' "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+    # KWin script: iterate over windows, close the one whose caption matches.
+    # API differs between KWin 5 (clientList) and KWin 6 (windowList).
+    local script_name="apex-close-keyboard-$$"
+    local script_file="/tmp/${script_name}.js"
+    cat > "$script_file" << EOF
+(function () {
+    const target = "${escaped_title}";
+    const list = (typeof workspace.windowList === "function")
+        ? workspace.windowList()
+        : workspace.clientList();
+    for (const w of list) {
+        if (w.caption === target) {
+            w.closeWindow();
+        }
+    }
+})();
+EOF
+    chmod 644 "$script_file"
+
+    sudo -u "$user" env \
+        HOME="$home" \
+        XDG_RUNTIME_DIR="/run/user/$uid" \
+        "$qdbus_bin" org.kde.KWin /Scripting \
+        org.kde.kwin.Scripting.loadScript "$script_file" >/dev/null 2>&1 || true
+
+    sudo -u "$user" env \
+        HOME="$home" \
+        XDG_RUNTIME_DIR="/run/user/$uid" \
+        "$qdbus_bin" org.kde.KWin /Scripting \
+        org.kde.kwin.Scripting.start >/dev/null 2>&1 || true
+
+    sleep 0.5
+
+    sudo -u "$user" env \
+        HOME="$home" \
+        XDG_RUNTIME_DIR="/run/user/$uid" \
+        "$qdbus_bin" org.kde.KWin /Scripting \
+        org.kde.kwin.Scripting.unloadScript "$script_name" >/dev/null 2>&1 || true
+
+    rm -f "$script_file"
+    return 0
+}
+
+# Ensure ~/.config/kwinrc has XwaylandEisNoPromptApps containing "steam".
+# Returns 0 if a change was made, 1 if the value was already correct.
+steam_ensure_kwinrc() {
+    local user home kwinrc current_val new_val
+    user=$(get_real_user)
+    home=$(get_real_home)
+    kwinrc="${home}/.config/kwinrc"
+
+    if [[ -f "$kwinrc" ]]; then
+        current_val=$(awk '
+            /^\[Xwayland\]/ {s=1; next}
+            /^\[/ {s=0}
+            s && /^XwaylandEisNoPromptApps=/ {sub(/^[^=]*=/, ""); print}
+        ' "$kwinrc")
+    fi
+
+    [[ ",${current_val}," == *",steam,"* ]] && return 1
+
+    if [[ -z "$current_val" ]]; then
+        new_val="steam"
+    else
+        new_val="${current_val},steam"
+    fi
+
+    if command -v kwriteconfig6 >/dev/null 2>&1; then
+        steam_as_user kwriteconfig6 --file kwinrc --group Xwayland \
+            --key XwaylandEisNoPromptApps "$new_val" 2>/dev/null || true
+    elif command -v kwriteconfig5 >/dev/null 2>&1; then
+        steam_as_user kwriteconfig5 --file kwinrc --group Xwayland \
+            --key XwaylandEisNoPromptApps "$new_val" 2>/dev/null || true
+    else
+        if [[ ! -f "$kwinrc" ]]; then
+            printf '[Xwayland]\nXwaylandEisNoPromptApps=%s\n' "$new_val" \
+                | sudo -u "$user" tee "$kwinrc" >/dev/null
+        elif grep -q '^\[Xwayland\]' "$kwinrc"; then
+            if grep -q '^XwaylandEisNoPromptApps=' "$kwinrc"; then
+                sudo -u "$user" sed -i \
+                    "s|^XwaylandEisNoPromptApps=.*|XwaylandEisNoPromptApps=$new_val|" "$kwinrc"
+            else
+                sudo -u "$user" sed -i \
+                    '/^\[Xwayland\]/a XwaylandEisNoPromptApps='"$new_val" "$kwinrc"
+            fi
+        else
+            printf '\n[Xwayland]\nXwaylandEisNoPromptApps=%s\n' "$new_val" \
+                | sudo -u "$user" tee -a "$kwinrc" >/dev/null
+        fi
+    fi
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Stage: Steam setup
+# -----------------------------------------------------------------------------
+run_steam_stage() {
+    local user home uid
+    user=$(get_real_user)
+    home=$(get_real_home)
+    uid=$(id -u "$user")
+
+    if ! command -v xprop >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="xprop is not installed."
+        return 1
+    fi
+    if ! command -v qdbus6 >/dev/null 2>&1 && ! command -v qdbus >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="qdbus is not installed (needed to close the keyboard window)."
+        return 1
+    fi
+
+    local changed=0
+
+    # ---- 1. Silent autostart -------------------------------------------------
+    local autostart_dir="${home}/.config/autostart"
+    local desktop_dst="${autostart_dir}/${STEAM_DESKTOP_NAME}"
+
+    if [[ ! -f "$desktop_dst" ]]; then
+        if [[ ! -f "$STEAM_DESKTOP_SRC" ]]; then
+            STEAM_FAIL_REASON="Source .desktop not found: $STEAM_DESKTOP_SRC"
+            return 1
+        fi
+        sudo -u "$user" mkdir -p "$autostart_dir"
+        sudo -u "$user" cp "$STEAM_DESKTOP_SRC" "$desktop_dst"
+        changed=1
+    fi
+
+    # ---- 2. kwinrc Xwayland entry -------------------------------------------
+    if steam_ensure_kwinrc; then
+        changed=1
+    fi
+
+    # ---- 3. Launch Steam if not running -------------------------------------
+    if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
+        echo "Launching Steam (this may take a while)..."
+        steam_as_user gtk-launch org.anatase.Steam.Silent &>/dev/null &
+        for _ in $(seq 1 60); do
+            sleep 1
+            pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
+        done
+        sleep 5
+    fi
+
+    # ---- 4. Find keyboard window --------------------------------------------
+    local win=""
+    win=$(find_steam_keyboard_window || true)
+
+    if [[ -z "$win" ]]; then
+        steam_as_user steam "steam://open/keyboard" &>/dev/null &
+        for _ in $(seq 1 30); do
+            sleep 0.5
+            win=$(find_steam_keyboard_window || true)
+            [[ -n "$win" ]] && break
+        done
+    fi
+
+    if [[ -z "$win" ]]; then
+        STEAM_FAIL_REASON="Steam keyboard window not found."
+        return 1
+    fi
+
+    # ---- 5. Read title and close --------------------------------------------
+    local title
+    title=$(steam_as_user xprop -id "$win" _NET_WM_NAME 2>/dev/null \
+            | sed 's/^[^=]*= //' | tr -d '"')
+    if [[ -z "$title" ]]; then
+        STEAM_FAIL_REASON="Could not read keyboard window title."
+        return 1
+    fi
+
+    close_window_by_caption "$title" || true
+
+    # ---- 6. Write KWin window rule ------------------------------------------
+    local kc=""
+    if command -v kwriteconfig6 >/dev/null 2>&1; then
+        kc=kwriteconfig6
+    elif command -v kwriteconfig5 >/dev/null 2>&1; then
+        kc=kwriteconfig5
+    else
+        STEAM_FAIL_REASON="kwriteconfig not found."
+        return 1
+    fi
+    local krc="${kc/kwriteconfig/kreadconfig}"
+
+    local existing_title
+    existing_title=$(steam_as_user "$krc" --file kwinrulesrc \
+        --group "$STEAM_RULE_UUID" --key title --default "" 2>/dev/null || echo "")
+
+    if [[ "$existing_title" != "$title" ]]; then
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key Description "Window settings for Steam Keyboard"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key above "true"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key aboverule "2"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key ignoregeometry "true"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key ignoregeometryrule "2"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key maximizehoriz "true"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key maximizehorizrule "2"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityinactive "75"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityinactiverule "2"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key position "0,238"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key positionrule "2"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key skiptaskbar "true"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key skiptaskbarrule "2"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key title "$title"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key titlematch "2"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclass "steam"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclasscomplete "true"
+        steam_as_user "$kc" --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclassmatch "2"
+
+        local rules
+        rules=$(steam_as_user "$krc" --file kwinrulesrc --group General \
+            --key rules --default "" 2>/dev/null || echo "")
+        if [[ ",$rules," != *",$STEAM_RULE_UUID,"* ]]; then
+            if [[ -z "$rules" ]]; then
+                steam_as_user "$kc" --file kwinrulesrc --group General --key rules "$STEAM_RULE_UUID"
+            else
+                steam_as_user "$kc" --file kwinrulesrc --group General --key rules "${rules},${STEAM_RULE_UUID}"
+            fi
+        fi
+
+        steam_as_user qdbus org.kde.KWin /KWin reconfigure 2>/dev/null || true
+
+        changed=1
+    fi
+
+    if [[ $changed -eq 1 ]]; then
+        print_status "Steam setup" "done"
+    else
+        print_status "Steam setup" "not needed"
+    fi
     return 0
 }
 
@@ -378,6 +686,13 @@ if run_hhd_stage; then
     stages_ok=$((stages_ok + 1))
 else
     print_status "HHD settings" "error"
+    stages_error=$((stages_error + 1))
+fi
+
+if run_steam_stage; then
+    stages_ok=$((stages_ok + 1))
+else
+    print_status "Steam setup" "error" "$STEAM_FAIL_REASON"
     stages_error=$((stages_error + 1))
 fi
 
