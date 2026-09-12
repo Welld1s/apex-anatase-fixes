@@ -94,6 +94,7 @@ HHD_SETTINGS=(
 
 # Steam setup
 STEAM_DESKTOP_SRC="/var/lib/flatpak/exports/share/applications/org.anatase.Steam.Silent.desktop"
+STEAM_DESKTOP_ID="org.anatase.Steam.Silent"
 STEAM_DESKTOP_NAME="org.anatase.Steam.Silent.desktop"
 STEAM_RULE_UUID="94ba89ad-c6f6-41ba-9d44-4113517758ff"
 
@@ -113,7 +114,6 @@ STEAM_FAIL_REASON=""
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-# Print a stage line and, optionally, a reason on the next line in red.
 print_status() {
     local stage="$1" status="$2" reason="${3:-}"
     local color
@@ -142,7 +142,11 @@ get_real_home() {
     eval echo "~$user"
 }
 
-# Run a command in the real user's graphical session environment.
+# Run a command in the real user's graphical session context, with the
+# session D-Bus address and desktop identifier explicitly set. Without
+# DBUS_SESSION_BUS_ADDRESS a process spawned via sudo -u is *not* attached
+# to the user's session bus, and Flatpak refuses to launch with the error
+# "requires a working D-Bus session bus and flatpak-portal service".
 steam_as_user() {
     local user home uid
     user=$(get_real_user)
@@ -154,6 +158,8 @@ steam_as_user() {
         WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
         XAUTHORITY="$home/.Xauthority" \
         XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        XDG_CURRENT_DESKTOP="KDE" \
         "$@"
 }
 
@@ -166,6 +172,7 @@ kwin_call() {
     sudo -u "$user" env \
         HOME="$home" \
         XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
         busctl --user --quiet call org.kde.KWin "$@" 2>/dev/null || true
 }
 
@@ -376,7 +383,6 @@ run_hhd_stage() {
 # -----------------------------------------------------------------------------
 
 # Find the Steam on-screen keyboard window using xprop only.
-# Identified by combining WM_CLASS, window type and KDE user-creation time.
 find_steam_keyboard_window() {
     local win_list win
     win_list=$(steam_as_user xprop -root _NET_CLIENT_LIST 2>/dev/null \
@@ -400,8 +406,6 @@ find_steam_keyboard_window() {
             *) continue ;;
         esac
 
-        # _KDE_NET_WM_USER_CREATION_TIME is a millisecond counter from
-        # X server start, not an epoch date. We only check presence and non-zero.
         local ct
         ct=$(steam_as_user xprop -id "$win" _KDE_NET_WM_USER_CREATION_TIME 2>/dev/null \
              | awk -F'= ' '{print $2}' | tr -d ' ')
@@ -414,16 +418,12 @@ find_steam_keyboard_window() {
 }
 
 # Close a window by its exact caption using KWin's D-Bus scripting interface.
-# This is a system-native equivalent of WM_DELETE_WINDOW: KWin itself closes
-# the window, so no external tools (xdotool, wmctrl) are required.
 close_window_by_caption() {
     local title="$1"
 
-    # Escape the title for safe embedding in a JS string
     local escaped_title
     escaped_title=$(printf '%s' "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
-    # KWin 6 script: iterate over windows, close the one whose caption matches.
     local script_name="apex-close-keyboard-$$"
     local script_file="/tmp/${script_name}.js"
     cat > "$script_file" << EOF
@@ -448,7 +448,6 @@ EOF
 }
 
 # Ensure ~/.config/kwinrc has XwaylandEisNoPromptApps containing "steam".
-# Returns 0 if a change was made, 1 if the value was already correct.
 steam_ensure_kwinrc() {
     local user home kwinrc current_val new_val
     user=$(get_real_user)
@@ -516,33 +515,19 @@ run_steam_stage() {
     fi
 
     # ---- 2. kwinrc Xwayland entry -------------------------------------------
-    # Adds "steam" to XwaylandEisNoPromptApps. This is required for the
-    # gamepad to work correctly in desktop mode; the change only takes
-    # effect after a reboot.
     if steam_ensure_kwinrc; then
         changed=1
         reboot_needed=1
     fi
 
     # ---- 3. Launch Steam if not running -------------------------------------
+    # Launch the .desktop shortcut in the user's session context. gtk-launch
+    # reads the Exec= line, but the process itself is our child — so the
+    # DBUS_SESSION_BUS_ADDRESS and XDG_CURRENT_DESKTOP set by steam_as_user
+    # are what make flatpak-portal usable here.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
-        # Extract the actual command from the .desktop file. Running the
-        # Exec= line directly bypasses flatpak-portal, so we don't need to
-        # publish DISPLAY to the D-Bus activation environment.
-        local exec_line
-        exec_line=$(grep -E '^Exec=' "$STEAM_DESKTOP_SRC" | head -1 | cut -d= -f2-)
-
-        if [[ -z "$exec_line" ]]; then
-            STEAM_FAIL_REASON="Could not read Exec= from $STEAM_DESKTOP_SRC"
-            return 1
-        fi
-
-        # Strip Flatpak field codes (%U, %u, %F, %f, @@ …) — they are only
-        # meaningful when the app is launched with file arguments.
-        exec_line=$(printf '%s' "$exec_line" | sed -E 's/ *(@@[a-zA-Z]?|%[a-zA-Z])//g')
-
         echo "Launching Steam (this may take a while)..."
-        steam_as_user sh -c "$exec_line" &>/dev/null &
+        steam_as_user gtk-launch "$STEAM_DESKTOP_ID" &>/dev/null &
         for _ in $(seq 1 60); do
             sleep 1
             pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
