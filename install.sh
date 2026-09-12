@@ -142,11 +142,9 @@ get_real_home() {
     eval echo "~$user"
 }
 
-# Run a command in the real user's graphical session context, with the
-# session D-Bus address and desktop identifier explicitly set. Without
-# DBUS_SESSION_BUS_ADDRESS a process spawned via sudo -u is *not* attached
-# to the user's session bus, and Flatpak refuses to launch with the error
-# "requires a working D-Bus session bus and flatpak-portal service".
+# Run a command in the real user's graphical session context.
+# Used for lightweight tools (xprop, kwriteconfig6, busctl) that only need
+# DISPLAY/WAYLAND_DISPLAY and the session D-Bus address.
 steam_as_user() {
     local user home uid
     user=$(get_real_user)
@@ -161,6 +159,20 @@ steam_as_user() {
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
         XDG_CURRENT_DESKTOP="KDE" \
         "$@"
+}
+
+# Launch a graphical application in the user's *systemd user session*.
+# systemd-run --user starts the command as a transient unit inside the
+# user's session scope, which is where flatpak-portal lives. This is the
+# reliable way to launch Flatpak apps from a root script.
+user_session_run() {
+    local user uid
+    user=$(get_real_user)
+    uid=$(id -u "$user")
+    sudo -u "$user" env \
+        XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        systemd-run --user --scope --quiet "$@"
 }
 
 # Call a D-Bus method on the user's KWin instance using busctl.
@@ -497,6 +509,10 @@ run_steam_stage() {
         STEAM_FAIL_REASON="kwriteconfig6 is not installed."
         return 1
     fi
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="systemd-run is not installed."
+        return 1
+    fi
 
     local changed=0
 
@@ -521,13 +537,13 @@ run_steam_stage() {
     fi
 
     # ---- 3. Launch Steam if not running -------------------------------------
-    # Launch the .desktop shortcut in the user's session context. gtk-launch
-    # reads the Exec= line, but the process itself is our child — so the
-    # DBUS_SESSION_BUS_ADDRESS and XDG_CURRENT_DESKTOP set by steam_as_user
-    # are what make flatpak-portal usable here.
+    # Launch via systemd-run --user so the process lives inside the user's
+    # systemd session scope, where flatpak-portal is available. Plain sudo -u
+    # is not enough: it detaches from the session bus Flatpak requires.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
         echo "Launching Steam (this may take a while)..."
-        steam_as_user gtk-launch "$STEAM_DESKTOP_ID" &>/dev/null &
+        user_session_run gtk-launch "$STEAM_DESKTOP_ID" &>/dev/null &
+
         for _ in $(seq 1 60); do
             sleep 1
             pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
