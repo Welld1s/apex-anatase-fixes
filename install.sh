@@ -170,6 +170,22 @@ kwin_call() {
         busctl --user --quiet call org.kde.KWin "$@" 2>/dev/null || true
 }
 
+# Read a variable from the environment of a running session process.
+# KWin (and its Xwayland) sets the true DISPLAY / WAYLAND_DISPLAY /
+# XAUTHORITY for this user's graphical session; our root shell does not have
+# them, and `su -` resets them again. Reading them from /proc fixes both.
+read_session_var() {
+    local user="$1" var="$2"
+    local pid name
+    for name in kwin_wayland kwin_x11 Xwayland plasmashell; do
+        pid=$(pgrep -u "$user" -x "$name" 2>/dev/null | head -1)
+        [[ -n "$pid" ]] && break
+    done
+    [[ -z "$pid" ]] && return 1
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+        | grep "^${var}=" | head -1 | cut -d= -f2-
+}
+
 # -----------------------------------------------------------------------------
 # Fingerprint controller lookup
 # -----------------------------------------------------------------------------
@@ -513,9 +529,9 @@ run_steam_stage() {
 
     # ---- 3. Launch Steam if not running -------------------------------------
     # Full Exec= line taken from the .desktop file verbatim.
-    # `su -` gives a login session (needed for flatpak-portal), and the
-    # graphical session variables are re-exported explicitly because `su -`
-    # resets the environment.
+    # `su -` gives a login session (needed for flatpak-portal) but resets the
+    # environment, so we recover the real graphical session variables from
+    # the running KWin process and re-export them inside `su`.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
         echo "Launching Steam (this may take a while)..."
 
@@ -527,12 +543,21 @@ run_steam_stage() {
             return 1
         fi
 
+        # Recover the real graphical session variables from KWin.
+        local sess_display sess_wayland sess_xauth
+        sess_display=$(read_session_var "$user" DISPLAY || echo "")
+        sess_wayland=$(read_session_var "$user" WAYLAND_DISPLAY || echo "")
+        sess_xauth=$(read_session_var "$user" XAUTHORITY || echo "")
+
+        local env_exports=""
+        [[ -n "$sess_display" ]] && env_exports+="DISPLAY='$sess_display' "
+        [[ -n "$sess_wayland" ]] && env_exports+="WAYLAND_DISPLAY='$sess_wayland' "
+        [[ -n "$sess_xauth"   ]] && env_exports+="XAUTHORITY='$sess_xauth' "
+
         su - "$user" -c "
-            export DISPLAY='$DISPLAY' \
-                   WAYLAND_DISPLAY='$WAYLAND_DISPLAY' \
+            export $env_exports \
                    XDG_RUNTIME_DIR='/run/user/$uid' \
                    DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/$uid/bus' \
-                   XAUTHORITY='$home/.Xauthority' \
                    XDG_CURRENT_DESKTOP='KDE'
             setsid $exec_line >/dev/null 2>&1 < /dev/null &
         "
