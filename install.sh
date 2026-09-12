@@ -16,65 +16,22 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.0-1
+# Version: 1.3.0
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Script metadata
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="1.3.0-1"
+SCRIPT_VERSION="1.3.0-2"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
 # Auto-elevate to root if not already, preserving graphical session variables
 # so the Steam launcher can find the display server later.
-#
-# If a password is required but we have no terminal to prompt on, sudo would
-# hang forever — bail out with a clear message instead.
 # -----------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
     echo "Requesting root privileges..."
-
-    if ! command -v sudo >/dev/null 2>&1; then
-        echo "sudo not found. Please re-run this script as root." >&2
-        exit 1
-    fi
-
-    SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]:-$0}")
-    if [[ ! -f "$SCRIPT_PATH" ]]; then
-        echo "Cannot locate script file: ${BASH_SOURCE[0]:-$0}" >&2
-        exit 1
-    fi
-
-    if sudo -n true 2>/dev/null; then
-        # Passwordless sudo — run silently.
-        if ! sudo -n \
-                DISPLAY="${DISPLAY:-}" \
-                WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
-                XAUTHORITY="${XAUTHORITY:-}" \
-                XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
-                -- "$SCRIPT_PATH" "$@"; then
-            echo "Failed to elevate to root." >&2
-            exit 1
-        fi
-    elif [[ -t 0 && -t 1 ]]; then
-        # Interactive terminal — plain sudo, prompts for password.
-        if ! sudo \
-                DISPLAY="${DISPLAY:-}" \
-                WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
-                XAUTHORITY="${XAUTHORITY:-}" \
-                XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
-                -- "$SCRIPT_PATH" "$@"; then
-            echo "Failed to elevate to root." >&2
-            exit 1
-        fi
-    else
-        echo "Cannot prompt for a password: no terminal attached." >&2
-        echo "Please run this script from a terminal, or as root." >&2
-        exit 1
-    fi
-
-    exit 0
+    exec sudo --preserve-env=DISPLAY,WAYLAND_DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR "$0" "$@"
 fi
 
 # -----------------------------------------------------------------------------
@@ -574,14 +531,10 @@ run_steam_stage() {
     # Exec= taken from the .desktop verbatim, then stripped of desktop-file
     # field codes (%U %u %F %f %i %c %k) — those are expanded by the launcher,
     # and we pass no URLs. The flatpak file-forwarding markers @@u ... @@ stay
-    # (empty block is valid).
-    #
-    # Two launch strategies are attempted:
-    #   a) direct sudo -u + setsid -f — mirrors the exact command verified by
-    #      hand on this device;
-    #   b) transient systemd --user unit — a fallback in case the sudo PAM
-    #      session scope tears the process down on exit.
-    # All output is discarded; on failure the caller only sees one message.
+    # (empty block is valid). Steam is launched as a transient systemd user
+    # unit, so it lives in the user's session cgroup and survives this script
+    # exiting. All output is discarded — on failure we only report that Steam
+    # could not be started.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
         echo "Launching Steam (this may take a while)..."
 
@@ -601,53 +554,30 @@ run_steam_stage() {
         exec_line=${exec_line//%k/}
         exec_line=$(echo "$exec_line" | tr -s ' ' | sed 's/ $//')
 
-        # Real display vars from the running KWin; XDG_RUNTIME_DIR and the
-        # DBus address are the standard per-uid paths.
-        local sess_display sess_wayland
-        sess_display=$(read_session_var "$user" DISPLAY         || true)
-        sess_wayland=$(read_session_var "$user" WAYLAND_DISPLAY || true)
+        # Recover the real graphical session variables from KWin.
+        local sess_display sess_wayland sess_xauth sess_runtime
+        sess_display=$(read_session_var "$user" DISPLAY         || echo "")
+        sess_wayland=$(read_session_var "$user" WAYLAND_DISPLAY || echo "")
+        sess_xauth=$(read_session_var   "$user" XAUTHORITY      || echo "")
+        sess_runtime=$(read_session_var "$user" XDG_RUNTIME_DIR || echo "/run/user/$uid")
 
-        local runtime_dir="/run/user/$uid"
-
-        # ---- attempt (a): direct launch, detached with setsid -f ------------
         sudo -u "$user" \
             env HOME="$home" \
-                DISPLAY="${sess_display:-:0}" \
-                WAYLAND_DISPLAY="${sess_wayland:-wayland-0}" \
-                XDG_RUNTIME_DIR="$runtime_dir" \
-                DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" \
-                XDG_CURRENT_DESKTOP="KDE" \
-            setsid -f $exec_line </dev/null >/dev/null 2>&1 || true
+                XDG_RUNTIME_DIR="$sess_runtime" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${sess_runtime}/bus" \
+            systemd-run --user --quiet --collect \
+                --unit="steam-launch-$$" \
+                --setenv=DISPLAY="${sess_display:-:0}" \
+                --setenv=WAYLAND_DISPLAY="${sess_wayland:-wayland-0}" \
+                --setenv=XAUTHORITY="${sess_xauth:-$home/.Xauthority}" \
+                --setenv=XDG_CURRENT_DESKTOP=KDE \
+                -- $exec_line \
+            >/dev/null 2>&1 || true
 
-        for _ in $(seq 1 30); do
+        for _ in $(seq 1 60); do
             sleep 1
             pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
         done
-
-        # ---- attempt (b): transient user unit ------------------------------
-        if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 \
-           && command -v systemd-run >/dev/null 2>&1; then
-            sudo -u "$user" \
-                env HOME="$home" \
-                    XDG_RUNTIME_DIR="$runtime_dir" \
-                    DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" \
-                systemd-run --user --quiet --collect \
-                    --unit="steam-launch-$$" \
-                    --setenv=HOME="$home" \
-                    --setenv=DISPLAY="${sess_display:-:0}" \
-                    --setenv=WAYLAND_DISPLAY="${sess_wayland:-wayland-0}" \
-                    --setenv=XDG_RUNTIME_DIR="$runtime_dir" \
-                    --setenv=DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" \
-                    --setenv=XDG_CURRENT_DESKTOP="KDE" \
-                    -- $exec_line \
-                >/dev/null 2>&1 || true
-
-            for _ in $(seq 1 30); do
-                sleep 1
-                pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
-            done
-        fi
-
         sleep 5
 
         if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
