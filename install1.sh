@@ -7,19 +7,19 @@ set -euo pipefail
 # Description:
 #   Applies all known fixes for OneXPlayer Apex running Anatase OS.
 #   Stages:
-#     Preparation              - validate OS, version, hardware
+#     Preparation               - validate OS, version, hardware
 #     Fingerprint sensor tweaks - PME disable + udev rule + GPIO kernel arg
-#     Gamemode shortcut        - copy .desktop to user's Desktop
-#     HHD settings             - apply curated HHD preset
-#     Steam setup              - silent autostart, kwinrc gamepad fix,
-#                                keyboard window rule
+#     Gamemode shortcut         - copy .desktop to user's Desktop
+#     HHD settings              - apply curated HHD preset
+#     Steam setup               - silent autostart, desktop gamepad tweak,
+#                                 on-screen keyboard scaling fix
 #
 #   The script is idempotent: it checks current state before making changes.
 #
 # Version: 1.3.0
 # =============================================================================
 
-SCRIPT_VERSION="1.3.0-5"
+SCRIPT_VERSION="1.3.0"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 if [[ $EUID -ne 0 ]]; then
@@ -132,21 +132,14 @@ get_real_home() {
 }
 
 # Read a variable from the environment of the user's graphical session.
-#
-# kwin_wayland in Plasma 6 does NOT export DISPLAY / XAUTHORITY in its own
-# environ — those are set only for its children (Xwayland, apps). So we try
-# several sources in order:
-#   1. plasmashell (always has WAYLAND_DISPLAY, DISPLAY, XAUTHORITY)
-#   2. kwin_wayland / kwin_x11 / Xwayland
-#   3. systemd user manager environment
-#   4. for XAUTHORITY only: autodetect /run/user/<uid>/xauth_*
+# kwin_wayland does not export DISPLAY/XAUTHORITY in its own environ, so we
+# try several sources in order and return the first non-empty value.
 read_session_var() {
     local user="$1" var="$2"
     local uid pid name val
 
     uid=$(id -u "$user" 2>/dev/null || echo "")
 
-    # 1+2. /proc/<pid>/environ of the session processes.
     for name in plasmashell kwin_wayland kwin_x11 Xwayland xdg-desktop-portal-kde; do
         pid=$(pgrep -u "$user" -x "$name" 2>/dev/null | head -1)
         [[ -z "$pid" ]] && continue
@@ -158,7 +151,6 @@ read_session_var() {
         fi
     done
 
-    # 3. systemd --user manager environment.
     if [[ -n "$uid" ]]; then
         val=$(sudo -u "$user" \
                 env XDG_RUNTIME_DIR="/run/user/$uid" \
@@ -170,7 +162,6 @@ read_session_var() {
         fi
     fi
 
-    # 4. XAUTHORITY special case — KWin writes it under /run/user/<uid>/.
     if [[ "$var" == "XAUTHORITY" && -n "$uid" ]]; then
         val=$(ls -1t /run/user/"$uid"/xauth_* 2>/dev/null | head -1 || true)
         if [[ -n "$val" ]]; then
@@ -182,7 +173,6 @@ read_session_var() {
     return 1
 }
 
-# Run a command as the real user with the real graphical session vars.
 steam_as_user() {
     local user home uid
     user=$(get_real_user)
@@ -409,8 +399,45 @@ run_gamemode_stage() {
 # -----------------------------------------------------------------------------
 # Stage: HHD settings
 # -----------------------------------------------------------------------------
+
+# Read a single HHD setting. Tolerates a few output shapes:
+#   "value", "key=value", "key: value", quotes, trailing whitespace.
+hhd_get() {
+    local key="$1" out
+    out=$(hhdctl get "$key" 2>/dev/null | head -1) || return 1
+    [[ -z "$out" ]] && return 1
+    out="${out#"$key"=}"
+    out="${out#"$key": }"
+    out="${out#"$key":}"
+    out=$(printf '%s' "$out" | awk '{ sub(/^[ \t]+/,""); sub(/[ \t]+$/,""); print }')
+    out="${out#\"}"; out="${out%\"}"
+    out="${out#\'}"; out="${out%\'}"
+    printf '%s' "$out"
+}
+
+# Returns 0 if every setting in HHD_SETTINGS already matches the live config.
+hhd_settings_match() {
+    local setting key expected current
+    for setting in "${HHD_SETTINGS[@]}"; do
+        key="${setting%%=*}"
+        expected="${setting#*=}"
+        if ! current=$(hhd_get "$key"); then
+            return 1
+        fi
+        if [[ "$current" != "$expected" ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 run_hhd_stage() {
     command -v hhdctl &>/dev/null || return 1
+
+    if hhd_settings_match; then
+        print_status "HHD settings" "not needed"
+        return 0
+    fi
 
     hhdctl set hhd.settings.reset=true &>/dev/null || return 1
     sleep "$HHD_RESET_DELAY"
@@ -428,42 +455,9 @@ run_hhd_stage() {
 # Steam helpers
 # -----------------------------------------------------------------------------
 
-dump_steam_windows() {
-    local user win_list win wmclass name wmtype
-    user=$(get_real_user)
-
-    echo "---- debug: session vars ----"
-    echo "  DISPLAY         = '$(read_session_var "$user" DISPLAY         || echo "<none>")'"
-    echo "  WAYLAND_DISPLAY = '$(read_session_var "$user" WAYLAND_DISPLAY || echo "<none>")'"
-    echo "  XAUTHORITY      = '$(read_session_var "$user" XAUTHORITY      || echo "<none>")'"
-    echo "  XDG_RUNTIME_DIR = '$(read_session_var "$user" XDG_RUNTIME_DIR || echo "<none>")'"
-
-    echo "---- debug: xprop -root _NET_CLIENT_LIST ----"
-    x11_as_user -root _NET_CLIENT_LIST || true
-
-    win_list=$(x11_as_user -root _NET_CLIENT_LIST \
-               | sed 's/.*# //' | tr ',' '\n' | tr -d ' ')
-
-    echo "---- debug: toplevel windows ----"
-    if [[ -z "$win_list" ]]; then
-        echo "  (empty — xprop could not enumerate windows)"
-    fi
-    for win in $win_list; do
-        [[ -n "$win" ]] || continue
-        wmclass=$(x11_as_user -id "$win" WM_CLASS \
-                  | sed 's/^[^=]*= //' | tr -d '"')
-        name=$(x11_as_user -id "$win" _NET_WM_NAME \
-               | sed 's/^[^=]*= //' | tr -d '"')
-        wmtype=$(x11_as_user -id "$win" _NET_WM_WINDOW_TYPE \
-                 | sed 's/^[^=]*= //')
-        echo "  win=$win wmclass='$wmclass' name='$name' type='$wmtype'"
-    done
-    echo "---------------------------------"
-}
-
 find_steam_keyboard_window() {
     local win_list win
-    win_list=$(x11_as_user -root _NET_CLIENT_LIST \
+    win_list=$(x11_as_user -root _NET_CLIENT_LIST 2>/dev/null \
                | sed 's/.*# //' | tr ',' '\n' | tr -d ' ')
 
     local candidates=()
@@ -472,7 +466,7 @@ find_steam_keyboard_window() {
         [[ -n "$win" ]] || continue
 
         local wmclass
-        wmclass=$(x11_as_user -id "$win" WM_CLASS \
+        wmclass=$(x11_as_user -id "$win" WM_CLASS 2>/dev/null \
                   | sed 's/^[^=]*= //' | tr -d '"' \
                   | tr 'A-Z' 'a-z' | tr -s ' ' | sed 's/^ //;s/ $//')
         case "$wmclass" in
@@ -481,7 +475,7 @@ find_steam_keyboard_window() {
         esac
 
         local name
-        name=$(x11_as_user -id "$win" _NET_WM_NAME \
+        name=$(x11_as_user -id "$win" _NET_WM_NAME 2>/dev/null \
                | sed 's/^[^=]*= //' | tr -d '"')
         [[ -n "$name" ]] || continue
 
@@ -501,10 +495,6 @@ find_steam_keyboard_window() {
         return 0
     fi
 
-    if [[ ${#candidates[@]} -gt 1 ]]; then
-        echo "Multiple steamwebhelper windows found:" >&2
-        printf '  %s\n' "${candidates[@]}" >&2
-    fi
     return 1
 }
 
@@ -528,14 +518,11 @@ close_window_by_caption() {
 EOF
     chmod 644 "$script_file"
 
-    local load_out start_out
-    load_out=$(kwin_call /Scripting org.kde.kwin.Scripting loadScript s "$script_file" 2>&1 || true)
-    start_out=$(kwin_call /Scripting org.kde.kwin.Scripting start 2>&1 || true)
-    echo "  kwin scripting loadScript: ${load_out:-<no output>}"
-    echo "  kwin scripting start:      ${start_out:-<no output>}"
+    kwin_call /Scripting org.kde.kwin.Scripting loadScript s "$script_file" &>/dev/null || true
+    kwin_call /Scripting org.kde.kwin.Scripting start &>/dev/null || true
 
     sleep 0.5
-    kwin_call /Scripting org.kde.kwin.Scripting unloadScript s "$script_name" 2>&1 || true
+    kwin_call /Scripting org.kde.kwin.Scripting unloadScript s "$script_name" &>/dev/null || true
 
     rm -f "$script_file"
     return 0
@@ -589,19 +576,6 @@ run_steam_stage() {
     if ! command -v kwriteconfig6 >/dev/null 2>&1; then
         STEAM_FAIL_REASON="kwriteconfig6 is not installed."
         return 1
-    fi
-
-    # ---- debug: session state once -----------------------------------------
-    local dbg_disp dbg_wl dbg_xauth dbg_rt
-    dbg_disp=$(read_session_var  "$user" DISPLAY         || echo "<none>")
-    dbg_wl=$(read_session_var    "$user" WAYLAND_DISPLAY || echo "<none>")
-    dbg_xauth=$(read_session_var "$user" XAUTHORITY      || echo "<none>")
-    dbg_rt=$(read_session_var    "$user" XDG_RUNTIME_DIR || echo "<none>")
-    echo "session: DISPLAY=$dbg_disp WAYLAND_DISPLAY=$dbg_wl XAUTHORITY=$dbg_xauth XDG_RUNTIME_DIR=$dbg_rt"
-
-    if ! x11_as_user -root _NET_CLIENT_LIST >/dev/null 2>&1; then
-        echo "WARN: xprop cannot talk to the X server with recovered session vars" >&2
-        x11_as_user -root _NET_CLIENT_LIST || true
     fi
 
     local changed=0
@@ -691,23 +665,18 @@ run_steam_stage() {
     fi
 
     if [[ -z "$win" ]]; then
-        dump_steam_windows >&2 || true
         STEAM_FAIL_REASON="Steam keyboard window not found."
         return 1
     fi
 
-    echo "Steam keyboard window id: $win"
-
     # ---- 5. Read title and close --------------------------------------------
     local title
-    title=$(x11_as_user -id "$win" _NET_WM_NAME \
+    title=$(x11_as_user -id "$win" _NET_WM_NAME 2>/dev/null \
             | sed 's/^[^=]*= //' | tr -d '"')
     if [[ -z "$title" ]]; then
         STEAM_FAIL_REASON="Steam keyboard window title unavailable."
         return 1
     fi
-
-    echo "Steam keyboard window title: '$title'"
 
     close_window_by_caption "$title" || true
 
@@ -747,7 +716,7 @@ run_steam_stage() {
             fi
         fi
 
-        kwin_call /KWin org.kde.KWin reconfigure 2>&1 || true
+        kwin_call /KWin org.kde.KWin reconfigure &>/dev/null || true
 
         changed=1
     fi
@@ -800,6 +769,9 @@ else
     stages_error=$((stages_error + 1))
 fi
 
+# -----------------------------------------------------------------------------
+# Final report
+# -----------------------------------------------------------------------------
 if [[ $stages_error -eq 0 ]]; then
     echo -e "${GREEN}All fixes installed successfully.${NC}"
 elif [[ $stages_ok -eq 1 ]]; then
