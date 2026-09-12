@@ -528,45 +528,62 @@ run_steam_stage() {
     fi
 
     # ---- 3. Launch Steam if not running -------------------------------------
-    # Full Exec= line taken from the .desktop file verbatim.
-    # `su -` gives a login session (needed for flatpak-portal) but resets the
-    # environment, so we recover the real graphical session variables from
-    # the running KWin process and re-export them inside `su`.
+    # Exec= taken from the .desktop verbatim, then stripped of desktop-file
+    # field codes (%U %u %F %f %i %c %k) — those are expanded by the launcher,
+    # and we pass no URLs. The flatpak file-forwarding markers @@u ... @@ stay
+    # (empty block is valid). Steam is launched as a transient systemd user
+    # unit, so it lives in the user's session cgroup and survives this script
+    # exiting. All output is discarded — on failure we only report that Steam
+    # could not be started.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
         echo "Launching Steam (this may take a while)..."
 
         local exec_line
-        exec_line=$(grep -E '^Exec=' "$STEAM_DESKTOP_SRC" | head -1 | cut -d= -f2-)
-
+        exec_line=$(grep -m1 '^Exec=' "$STEAM_DESKTOP_SRC" 2>/dev/null | cut -d= -f2- || echo "")
         if [[ -z "$exec_line" ]]; then
-            STEAM_FAIL_REASON="Could not read Exec= from $STEAM_DESKTOP_SRC"
+            STEAM_FAIL_REASON="Steam failed to launch."
             return 1
         fi
 
+        exec_line=${exec_line//%U/}
+        exec_line=${exec_line//%u/}
+        exec_line=${exec_line//%F/}
+        exec_line=${exec_line//%f/}
+        exec_line=${exec_line//%i/}
+        exec_line=${exec_line//%c/}
+        exec_line=${exec_line//%k/}
+        exec_line=$(echo "$exec_line" | tr -s ' ' | sed 's/ $//')
+
         # Recover the real graphical session variables from KWin.
-        local sess_display sess_wayland sess_xauth
-        sess_display=$(read_session_var "$user" DISPLAY || echo "")
+        local sess_display sess_wayland sess_xauth sess_runtime
+        sess_display=$(read_session_var "$user" DISPLAY         || echo "")
         sess_wayland=$(read_session_var "$user" WAYLAND_DISPLAY || echo "")
-        sess_xauth=$(read_session_var "$user" XAUTHORITY || echo "")
+        sess_xauth=$(read_session_var   "$user" XAUTHORITY      || echo "")
+        sess_runtime=$(read_session_var "$user" XDG_RUNTIME_DIR || echo "/run/user/$uid")
 
-        local env_exports=""
-        [[ -n "$sess_display" ]] && env_exports+="DISPLAY='$sess_display' "
-        [[ -n "$sess_wayland" ]] && env_exports+="WAYLAND_DISPLAY='$sess_wayland' "
-        [[ -n "$sess_xauth"   ]] && env_exports+="XAUTHORITY='$sess_xauth' "
-
-        su - "$user" -c "
-            export $env_exports \
-                   XDG_RUNTIME_DIR='/run/user/$uid' \
-                   DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/$uid/bus' \
-                   XDG_CURRENT_DESKTOP='KDE'
-            setsid $exec_line >/dev/null 2>&1 < /dev/null &
-        "
+        sudo -u "$user" \
+            env HOME="$home" \
+                XDG_RUNTIME_DIR="$sess_runtime" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${sess_runtime}/bus" \
+            systemd-run --user --quiet --collect \
+                --unit="steam-launch-$$" \
+                --setenv=DISPLAY="${sess_display:-:0}" \
+                --setenv=WAYLAND_DISPLAY="${sess_wayland:-wayland-0}" \
+                --setenv=XAUTHORITY="${sess_xauth:-$home/.Xauthority}" \
+                --setenv=XDG_CURRENT_DESKTOP=KDE \
+                -- $exec_line \
+            >/dev/null 2>&1 || true
 
         for _ in $(seq 1 60); do
             sleep 1
             pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
         done
         sleep 5
+
+        if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
+            STEAM_FAIL_REASON="Steam failed to launch."
+            return 1
+        fi
     fi
 
     # ---- 4. Find keyboard window --------------------------------------------
@@ -592,7 +609,7 @@ run_steam_stage() {
     title=$(steam_as_user xprop -id "$win" _NET_WM_NAME 2>/dev/null \
             | sed 's/^[^=]*= //' | tr -d '"')
     if [[ -z "$title" ]]; then
-        STEAM_FAIL_REASON="Could not read keyboard window title."
+        STEAM_FAIL_REASON="Steam keyboard window not found."
         return 1
     fi
 
