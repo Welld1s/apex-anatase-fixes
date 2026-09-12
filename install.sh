@@ -16,10 +16,10 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.2
+# Version: 1.3.3
 # =============================================================================
 
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.3.3"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 echo "============================"
 
@@ -700,6 +700,10 @@ run_steam_stage() {
     home=$(get_real_home)
     uid=$(id -u "$user")
 
+    if ! command -v steam >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="Steam is not installed. Enter Gamemode at least once for installation."
+        return 1
+    fi
     if ! command -v xprop >/dev/null 2>&1; then
         STEAM_FAIL_REASON="xprop is not installed."
         return 1
