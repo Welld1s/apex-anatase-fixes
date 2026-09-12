@@ -16,12 +16,12 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.1
+# Version: 1.3.2
 # =============================================================================
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
-echo
+echo "============================"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Requesting root privileges..."
