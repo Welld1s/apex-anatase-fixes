@@ -152,12 +152,12 @@ steam_as_user() {
         HOME="$home" \
         DISPLAY="${DISPLAY:-:0}" \
         WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+        XAUTHORITY="$home/.Xauthority" \
         XDG_RUNTIME_DIR="/run/user/$uid" \
         "$@"
 }
 
 # Call a D-Bus method on the user's KWin instance using busctl.
-# Usage: kwin_call <object_path> <interface> <method> [signature args...]
 kwin_call() {
     local user home uid
     user=$(get_real_user)
@@ -526,8 +526,23 @@ run_steam_stage() {
 
     # ---- 3. Launch Steam if not running -------------------------------------
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
+        # Extract the actual command from the .desktop file. Running the
+        # Exec= line directly bypasses flatpak-portal, so we don't need to
+        # publish DISPLAY to the D-Bus activation environment.
+        local exec_line
+        exec_line=$(grep -E '^Exec=' "$STEAM_DESKTOP_SRC" | head -1 | cut -d= -f2-)
+
+        if [[ -z "$exec_line" ]]; then
+            STEAM_FAIL_REASON="Could not read Exec= from $STEAM_DESKTOP_SRC"
+            return 1
+        fi
+
+        # Strip Flatpak field codes (%U, %u, %F, %f, @@ …) — they are only
+        # meaningful when the app is launched with file arguments.
+        exec_line=$(printf '%s' "$exec_line" | sed -E 's/ *(@@[a-zA-Z]?|%[a-zA-Z])//g')
+
         echo "Launching Steam (this may take a while)..."
-        steam_as_user gtk-launch org.anatase.Steam.Silent &>/dev/null &
+        steam_as_user sh -c "$exec_line" &>/dev/null &
         for _ in $(seq 1 60); do
             sleep 1
             pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
