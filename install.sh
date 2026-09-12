@@ -16,10 +16,10 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.3
+# Version: 1.3.4
 # =============================================================================
 
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 echo "============================"
 
@@ -700,10 +700,16 @@ run_steam_stage() {
     home=$(get_real_home)
     uid=$(id -u "$user")
 
-    if ! command -v steam >/dev/null 2>&1; then
+    if ! command -v flatpak >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="flatpak is not installed."
+        return 1
+    fi
+    
+    if ! flatpak info org.anatase.Steam >/dev/null 2>&1; then
         STEAM_FAIL_REASON="Steam is not installed. Enter Gamemode at least once for installation."
         return 1
     fi
+    
     if ! command -v xprop >/dev/null 2>&1; then
         STEAM_FAIL_REASON="xprop is not installed."
         return 1
