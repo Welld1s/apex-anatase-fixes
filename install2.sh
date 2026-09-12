@@ -22,7 +22,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Script metadata
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="1.3.0-2"
+SCRIPT_VERSION="1.3.0-4"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 
 # -----------------------------------------------------------------------------
@@ -142,34 +142,6 @@ get_real_home() {
     eval echo "~$user"
 }
 
-steam_as_user() {
-    local user home uid
-    user=$(get_real_user)
-    home=$(get_real_home)
-    uid=$(id -u "$user")
-    sudo -u "$user" env \
-        HOME="$home" \
-        DISPLAY="${DISPLAY:-:0}" \
-        WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
-        XAUTHORITY="$home/.Xauthority" \
-        XDG_RUNTIME_DIR="/run/user/$uid" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-        XDG_CURRENT_DESKTOP="KDE" \
-        "$@"
-}
-
-kwin_call() {
-    local user home uid
-    user=$(get_real_user)
-    home=$(get_real_home)
-    uid=$(id -u "$user")
-    sudo -u "$user" env \
-        HOME="$home" \
-        XDG_RUNTIME_DIR="/run/user/$uid" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-        busctl --user --quiet call org.kde.KWin "$@" 2>/dev/null || true
-}
-
 # Read a variable from the environment of a running session process.
 # KWin (and its Xwayland) sets the true DISPLAY / WAYLAND_DISPLAY /
 # XAUTHORITY for this user's graphical session; our root shell does not have
@@ -184,6 +156,53 @@ read_session_var() {
     [[ -z "$pid" ]] && return 1
     tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
         | grep "^${var}=" | head -1 | cut -d= -f2-
+}
+
+# Run a command as the real user, with the real graphical session variables
+# recovered from the running compositor. The old version hard-coded
+# XAUTHORITY="$home/.Xauthority", which is wrong on Plasma 6 + Wayland —
+# KWin writes xauth to /run/user/<uid>/xauth_<random>, so xprop silently
+# failed to connect and every window query returned nothing.
+steam_as_user() {
+    local user home uid
+    user=$(get_real_user)
+    home=$(get_real_home)
+    uid=$(id -u "$user")
+
+    local s_display s_wayland s_xauth s_runtime
+    s_display=$(read_session_var "$user" DISPLAY         || echo "")
+    s_wayland=$(read_session_var "$user" WAYLAND_DISPLAY || echo "")
+    s_xauth=$(read_session_var   "$user" XAUTHORITY      || echo "")
+    s_runtime=$(read_session_var "$user" XDG_RUNTIME_DIR || echo "/run/user/$uid")
+
+    sudo -u "$user" env \
+        HOME="$home" \
+        DISPLAY="${s_display:-${DISPLAY:-:0}}" \
+        WAYLAND_DISPLAY="${s_wayland:-${WAYLAND_DISPLAY:-wayland-0}}" \
+        XAUTHORITY="${s_xauth:-$home/.Xauthority}" \
+        XDG_RUNTIME_DIR="$s_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${s_runtime}/bus" \
+        XDG_CURRENT_DESKTOP="KDE" \
+        "$@"
+}
+
+# X11 helper — always talks to the real session DISPLAY, no shell override.
+x11_as_user() {
+    steam_as_user xprop "$@"
+}
+
+# Call a KWin DBus method. Errors are no longer swallowed silently — if
+# scripting is broken, we want it in the log.
+kwin_call() {
+    local user home uid
+    user=$(get_real_user)
+    home=$(get_real_home)
+    uid=$(id -u "$user")
+    sudo -u "$user" env \
+        HOME="$home" \
+        XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        busctl --user --quiet call org.kde.KWin "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -392,37 +411,99 @@ run_hhd_stage() {
 # Steam helpers
 # -----------------------------------------------------------------------------
 
+# Dump all toplevel windows with their relevant properties — used for debug
+# when the keyboard window cannot be found. No 2>/dev/null: if xprop can't
+# connect, we want the error visible.
+dump_steam_windows() {
+    local win_list win wmclass name wmtype
+    echo "---- debug: session vars ----"
+    echo "  DISPLAY         = '$(read_session_var "$(get_real_user)" DISPLAY         || echo "<none>")'"
+    echo "  WAYLAND_DISPLAY = '$(read_session_var "$(get_real_user)" WAYLAND_DISPLAY || echo "<none>")'"
+    echo "  XAUTHORITY      = '$(read_session_var "$(get_real_user)" XAUTHORITY      || echo "<none>")'"
+    echo "  XDG_RUNTIME_DIR = '$(read_session_var "$(get_real_user)" XDG_RUNTIME_DIR || echo "<none>")'"
+
+    echo "---- debug: xprop -root _NET_CLIENT_LIST ----"
+    x11_as_user -root _NET_CLIENT_LIST || true
+
+    win_list=$(x11_as_user -root _NET_CLIENT_LIST \
+               | sed 's/.*# //' | tr ',' '\n' | tr -d ' ')
+
+    echo "---- debug: toplevel windows ----"
+    if [[ -z "$win_list" ]]; then
+        echo "  (empty — xprop could not enumerate windows)"
+    fi
+    for win in $win_list; do
+        [[ -n "$win" ]] || continue
+        wmclass=$(x11_as_user -id "$win" WM_CLASS \
+                  | sed 's/^[^=]*= //' | tr -d '"')
+        name=$(x11_as_user -id "$win" _NET_WM_NAME \
+               | sed 's/^[^=]*= //' | tr -d '"')
+        wmtype=$(x11_as_user -id "$win" _NET_WM_WINDOW_TYPE \
+                 | sed 's/^[^=]*= //')
+        echo "  win=$win wmclass='$wmclass' name='$name' type='$wmtype'"
+    done
+    echo "---------------------------------"
+}
+
+# Find the Steam on-screen keyboard window.
+#
+# The previous version was too strict: it required an exact WM_CLASS match,
+# a _NET_WM_WINDOW_TYPE_UTILITY, and a non-zero
+# _KDE_NET_WM_USER_CREATION_TIME. On Plasma 6 + Steam (Flatpak) none of the
+# three reliably hold at once:
+#   * WM_CLASS casing varies ("steamwebhelper"/"Steam" vs lowercase)
+#   * the keyboard is often a NORMAL/dialog window, not UTILITY
+#   * creation-time may be 0 or missing when the window is opened via
+#     steam://open/keyboard (no direct user click)
+#
+# New strategy: find steamwebhelper windows, prefer one whose title looks
+# like the on-screen keyboard, ignore the window type entirely.
 find_steam_keyboard_window() {
     local win_list win
-    win_list=$(steam_as_user xprop -root _NET_CLIENT_LIST 2>/dev/null \
+    win_list=$(x11_as_user -root _NET_CLIENT_LIST \
                | sed 's/.*# //' | tr ',' '\n' | tr -d ' ')
+
+    local candidates=()
 
     for win in $win_list; do
         [[ -n "$win" ]] || continue
 
         local wmclass
-        wmclass=$(steam_as_user xprop -id "$win" WM_CLASS 2>/dev/null \
-                  | sed 's/^[^=]*= //' | tr -d '"')
+        wmclass=$(x11_as_user -id "$win" WM_CLASS \
+                  | sed 's/^[^=]*= //' | tr -d '"' \
+                  | tr 'A-Z' 'a-z' | tr -s ' ' | sed 's/^ //;s/ $//')
         case "$wmclass" in
-            "steamwebhelper, steam"|"steamwebhelper, steamwebhelper") ;;
+            *steamwebhelper*) ;;
             *) continue ;;
         esac
 
-        local wmtype
-        wmtype=$(steam_as_user xprop -id "$win" _NET_WM_WINDOW_TYPE 2>/dev/null)
-        case "$wmtype" in
-            *"_NET_WM_WINDOW_TYPE_UTILITY"*) ;;
-            *) continue ;;
+        local name
+        name=$(x11_as_user -id "$win" _NET_WM_NAME \
+               | sed 's/^[^=]*= //' | tr -d '"')
+        [[ -n "$name" ]] || continue
+
+        local lname
+        lname=$(echo "$name" | tr 'A-Z' 'a-z')
+        case "$lname" in
+            *keyboard*|*клавиатура*)
+                echo "$win"
+                return 0
+                ;;
         esac
-
-        local ct
-        ct=$(steam_as_user xprop -id "$win" _KDE_NET_WM_USER_CREATION_TIME 2>/dev/null \
-             | awk -F'= ' '{print $2}' | tr -d ' ')
-        [[ -n "$ct" && "$ct" != "0" ]] || continue
-
-        echo "$win"
-        return 0
+        candidates+=("$win:$name")
     done
+
+    # No obvious keyboard title; if exactly one steamwebhelper window exists
+    # (typically after opening steam://open/keyboard), take it.
+    if [[ ${#candidates[@]} -eq 1 ]]; then
+        echo "${candidates[0]%%:*}"
+        return 0
+    fi
+
+    if [[ ${#candidates[@]} -gt 1 ]]; then
+        echo "Multiple steamwebhelper windows found:" >&2
+        printf '  %s\n' "${candidates[@]}" >&2
+    fi
     return 1
 }
 
@@ -446,10 +527,14 @@ close_window_by_caption() {
 EOF
     chmod 644 "$script_file"
 
-    kwin_call /Scripting org.kde.kwin.Scripting loadScript s "$script_file"
-    kwin_call /Scripting org.kde.kwin.Scripting start
+    local load_out start_out
+    load_out=$(kwin_call /Scripting org.kde.kwin.Scripting loadScript s "$script_file" 2>&1 || true)
+    start_out=$(kwin_call /Scripting org.kde.kwin.Scripting start 2>&1 || true)
+    echo "  kwin scripting loadScript: ${load_out:-<no output>}"
+    echo "  kwin scripting start:      ${start_out:-<no output>}"
+
     sleep 0.5
-    kwin_call /Scripting org.kde.kwin.Scripting unloadScript s "$script_name"
+    kwin_call /Scripting org.kde.kwin.Scripting unloadScript s "$script_name" 2>&1 || true
 
     rm -f "$script_file"
     return 0
@@ -505,6 +590,19 @@ run_steam_stage() {
         return 1
     fi
 
+    # ---- debug: session state once -----------------------------------------
+    local dbg_disp dbg_wl dbg_xauth dbg_rt
+    dbg_disp=$(read_session_var  "$user" DISPLAY         || echo "<none>")
+    dbg_wl=$(read_session_var    "$user" WAYLAND_DISPLAY || echo "<none>")
+    dbg_xauth=$(read_session_var "$user" XAUTHORITY      || echo "<none>")
+    dbg_rt=$(read_session_var    "$user" XDG_RUNTIME_DIR || echo "<none>")
+    echo "session: DISPLAY=$dbg_disp WAYLAND_DISPLAY=$dbg_wl XAUTHORITY=$dbg_xauth XDG_RUNTIME_DIR=$dbg_rt"
+
+    if ! x11_as_user -root _NET_CLIENT_LIST >/dev/null 2>&1; then
+        echo "WARN: xprop cannot talk to the X server with recovered session vars" >&2
+        x11_as_user -root _NET_CLIENT_LIST || true
+    fi
+
     local changed=0
 
     # ---- 1. Silent autostart -------------------------------------------------
@@ -528,13 +626,6 @@ run_steam_stage() {
     fi
 
     # ---- 3. Launch Steam if not running -------------------------------------
-    # Exec= taken from the .desktop verbatim, then stripped of desktop-file
-    # field codes (%U %u %F %f %i %c %k) — those are expanded by the launcher,
-    # and we pass no URLs. The flatpak file-forwarding markers @@u ... @@ stay
-    # (empty block is valid). Steam is launched as a transient systemd user
-    # unit, so it lives in the user's session cgroup and survives this script
-    # exiting. All output is discarded — on failure we only report that Steam
-    # could not be started.
     if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
         echo "Launching Steam (this may take a while)..."
 
@@ -554,7 +645,6 @@ run_steam_stage() {
         exec_line=${exec_line//%k/}
         exec_line=$(echo "$exec_line" | tr -s ' ' | sed 's/ $//')
 
-        # Recover the real graphical session variables from KWin.
         local sess_display sess_wayland sess_xauth sess_runtime
         sess_display=$(read_session_var "$user" DISPLAY         || echo "")
         sess_wayland=$(read_session_var "$user" WAYLAND_DISPLAY || echo "")
@@ -588,30 +678,35 @@ run_steam_stage() {
 
     # ---- 4. Find keyboard window --------------------------------------------
     local win=""
-    win=$(find_steam_keyboard_window || true)
+    win=$(find_steam_keyboard_window 2>/dev/null || true)
 
     if [[ -z "$win" ]]; then
         steam_as_user steam "steam://open/keyboard" &>/dev/null &
         for _ in $(seq 1 30); do
             sleep 0.5
-            win=$(find_steam_keyboard_window || true)
+            win=$(find_steam_keyboard_window 2>/dev/null || true)
             [[ -n "$win" ]] && break
         done
     fi
 
     if [[ -z "$win" ]]; then
+        dump_steam_windows >&2 || true
         STEAM_FAIL_REASON="Steam keyboard window not found."
         return 1
     fi
 
+    echo "Steam keyboard window id: $win"
+
     # ---- 5. Read title and close --------------------------------------------
     local title
-    title=$(steam_as_user xprop -id "$win" _NET_WM_NAME 2>/dev/null \
+    title=$(x11_as_user -id "$win" _NET_WM_NAME \
             | sed 's/^[^=]*= //' | tr -d '"')
     if [[ -z "$title" ]]; then
-        STEAM_FAIL_REASON="Steam keyboard window not found."
+        STEAM_FAIL_REASON="Steam keyboard window title unavailable."
         return 1
     fi
+
+    echo "Steam keyboard window title: '$title'"
 
     close_window_by_caption "$title" || true
 
@@ -651,7 +746,7 @@ run_steam_stage() {
             fi
         fi
 
-        kwin_call /KWin org.kde.KWin reconfigure
+        kwin_call /KWin org.kde.KWin reconfigure 2>&1 || true
 
         changed=1
     fi
