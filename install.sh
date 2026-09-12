@@ -16,7 +16,7 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.0
+# Version: 1.3.0-1
 # =============================================================================
 
 # -----------------------------------------------------------------------------
