@@ -16,10 +16,10 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.4
+# Version: 1.3.5
 # =============================================================================
 
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.3.5"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 echo "============================"
 
@@ -86,7 +86,7 @@ HHD_SETTINGS=(
 
 STEAM_DESKTOP_SRC="/var/lib/flatpak/exports/share/applications/org.anatase.Steam.Silent.desktop"
 STEAM_DESKTOP_NAME="org.anatase.Steam.Silent.desktop"
-STEAM_RULE_UUID="94ba89ad-c6f6-41ba-9d44-4113517758ff"
+STEAM_RULE_DESCRIPTION="Window settings for Steam Keyboard"
 
 # -----------------------------------------------------------------------------
 # State
@@ -132,9 +132,6 @@ get_real_home() {
     eval echo "~$user"
 }
 
-# Read a variable from the environment of the user's graphical session.
-# kwin_wayland does not export DISPLAY/XAUTHORITY in its own environ, so we
-# try several sources in order and return the first non-empty value.
 read_session_var() {
     local user="$1" var="$2"
     local uid pid name val
@@ -211,6 +208,14 @@ kwin_call() {
         XDG_RUNTIME_DIR="/run/user/$uid" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
         busctl --user --quiet call org.kde.KWin "$@"
+}
+
+generate_uuid() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr 'A-Z' 'a-z'
+    else
+        cat /proc/sys/kernel/random/uuid
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -401,8 +406,6 @@ run_gamemode_stage() {
 # Stage: HHD settings
 # -----------------------------------------------------------------------------
 
-# Read a single HHD setting. Tolerates a few output shapes:
-#   "value", "key=value", "key: value", quotes, trailing whitespace.
 hhd_get() {
     local key="$1" out
     out=$(hhdctl get "$key" 2>/dev/null | head -1) || return 1
@@ -416,7 +419,6 @@ hhd_get() {
     printf '%s' "$out"
 }
 
-# Returns 0 if every setting in HHD_SETTINGS already matches the live config.
 hhd_settings_match() {
     local setting key expected current
     for setting in "${HHD_SETTINGS[@]}"; do
@@ -561,11 +563,9 @@ steam_ensure_kwinrc() {
 # KWin rule helpers (Steam keyboard)
 # -----------------------------------------------------------------------------
 
-# Expected key=value pairs for the Steam keyboard rule. Only "title" is dynamic.
 steam_rule_expected() {
     local title="$1"
     cat <<EOF
-Description=Window settings for Steam Keyboard
 above=true
 aboverule=2
 ignoregeometry=true
@@ -586,12 +586,10 @@ wmclassmatch=2
 EOF
 }
 
-# All expected keys, one per line, sorted and unique.
 steam_rule_expected_keys() {
     steam_rule_expected "$1" | cut -d= -f1 | sort -u
 }
 
-# Returns 0 if every expected key has the expected value in the rule group.
 steam_rule_params_ok() {
     local uuid="$1" title="$2" line key expected current
     while IFS= read -r line; do
@@ -605,7 +603,6 @@ steam_rule_params_ok() {
     return 0
 }
 
-# Returns 0 if the rule group contains no keys beyond the expected set.
 steam_rule_no_extra_keys() {
     local uuid="$1" title="$2"
     local kwinrulesrc expected present k
@@ -621,6 +618,7 @@ steam_rule_no_extra_keys() {
 
     while IFS= read -r k; do
         [[ -n "$k" ]] || continue
+        [[ "$k" == "Description" ]] && continue
         if ! grep -qxF "$k" <<< "$expected"; then
             return 1
         fi
@@ -628,7 +626,6 @@ steam_rule_no_extra_keys() {
     return 0
 }
 
-# Find a rule UUID whose "title" equals the given title. Prints UUID on match.
 steam_rule_find_by_title() {
     local title="$1" uuid rule_title rules
     rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
@@ -646,7 +643,21 @@ steam_rule_find_by_title() {
     return 1
 }
 
-# Delete a rule: remove UUID from [General]/rules and drop the whole group.
+steam_rule_find_by_description() {
+    local description="$1" uuid rule_desc rules
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+    IFS=',' read -ra _arr <<< "$rules"
+    for uuid in "${_arr[@]}"; do
+        [[ -n "$uuid" ]] || continue
+        rule_desc=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$uuid" --key Description --default "" 2>/dev/null || echo "")
+        if [[ "$rule_desc" == "$description" ]]; then
+            echo "$uuid"
+        fi
+    done
+}
+
 steam_rule_delete() {
     local uuid="$1" rules new_rules r
     rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
@@ -667,9 +678,10 @@ steam_rule_delete() {
         --delete-group 2>/dev/null || true
 }
 
-# Write the full rule (all expected keys) with the given UUID and title.
 steam_rule_write() {
     local uuid="$1" title="$2" line key val rules
+    steam_as_user kwriteconfig6 --file kwinrulesrc \
+        --group "$uuid" --key Description "$STEAM_RULE_DESCRIPTION"
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         key="${line%%=*}"
@@ -704,12 +716,12 @@ run_steam_stage() {
         STEAM_FAIL_REASON="flatpak is not installed."
         return 1
     fi
-    
+
     if ! flatpak info org.anatase.Steam >/dev/null 2>&1; then
         STEAM_FAIL_REASON="Steam is not installed. Enter Gamemode at least once for installation."
         return 1
     fi
-    
+
     if ! command -v xprop >/dev/null 2>&1; then
         STEAM_FAIL_REASON="xprop is not installed."
         return 1
@@ -826,21 +838,50 @@ run_steam_stage() {
     close_window_by_caption "$title" || true
 
     # ---- 6. Reconcile KWin window rule --------------------------------------
-    local existing_uuid=""
-    existing_uuid=$(steam_rule_find_by_title "$title" || true)
+    local candidates=() u
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && candidates+=("$u")
+    done < <(steam_rule_find_by_title "$title" 2>/dev/null || true)
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && candidates+=("$u")
+    done < <(steam_rule_find_by_description "$STEAM_RULE_DESCRIPTION" 2>/dev/null || true)
 
-    if [[ -n "$existing_uuid" ]]; then
-        if steam_rule_params_ok "$existing_uuid" "$title" \
-           && steam_rule_no_extra_keys "$existing_uuid" "$title"; then
-            : # existing rule is exactly what we want - nothing to do
-        else
-            steam_rule_delete "$existing_uuid"
-            steam_rule_write "$STEAM_RULE_UUID" "$title"
-            kwin_call /KWin org.kde.KWin reconfigure &>/dev/null || true
-            changed=1
+    local -A seen=()
+    local uniq=()
+    for u in "${candidates[@]}"; do
+        [[ -n "${seen[$u]:-}" ]] && continue
+        seen[$u]=1
+        uniq+=("$u")
+    done
+
+    local kept=""
+    local rule_changed=0
+    for u in "${uniq[@]}"; do
+        if [[ -z "$kept" ]] \
+           && steam_rule_params_ok "$u" "$title" \
+           && steam_rule_no_extra_keys "$u" "$title"; then
+            kept="$u"
+            continue
         fi
+        steam_rule_delete "$u"
+        rule_changed=1
+    done
+
+    if [[ -z "$kept" ]]; then
+        steam_rule_write "$(generate_uuid)" "$title"
+        rule_changed=1
     else
-        steam_rule_write "$STEAM_RULE_UUID" "$title"
+        local cur_desc
+        cur_desc=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$kept" --key Description --default "" 2>/dev/null || echo "")
+        if [[ "$cur_desc" != "$STEAM_RULE_DESCRIPTION" ]]; then
+            steam_as_user kwriteconfig6 --file kwinrulesrc \
+                --group "$kept" --key Description "$STEAM_RULE_DESCRIPTION"
+            rule_changed=1
+        fi
+    fi
+
+    if [[ $rule_changed -eq 1 ]]; then
         kwin_call /KWin org.kde.KWin reconfigure &>/dev/null || true
         changed=1
     fi
