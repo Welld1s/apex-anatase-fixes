@@ -7,36 +7,27 @@ set -euo pipefail
 # Description:
 #   Applies all known fixes for OneXPlayer Apex running Anatase OS.
 #   Stages:
-#     Preparation              - validate OS, version, hardware
+#     Preparation               - validate OS, version, hardware
 #     Fingerprint sensor tweaks - PME disable + udev rule + GPIO kernel arg
-#     Gamemode shortcut        - copy .desktop to user's Desktop
-#     HHD settings             - apply curated HHD preset
-#     Steam setup              - silent autostart, kwinrc gamepad fix,
-#                                keyboard window rule
+#     Gamemode shortcut         - copy .desktop to user's Desktop
+#     HHD settings              - apply curated HHD preset
+#     Steam setup               - silent autostart, desktop gamepad tweak,
+#                                 on-screen keyboard scaling fix
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.0
+# Version: 1.3.8
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# Script metadata
-# -----------------------------------------------------------------------------
-SCRIPT_VERSION="1.3.0-4"
+SCRIPT_VERSION="1.3.8"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
+echo "============================"
 
-# -----------------------------------------------------------------------------
-# Auto-elevate to root if not already, preserving graphical session variables
-# so the Steam launcher can find the display server later.
-# -----------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
     echo "Requesting root privileges..."
     exec sudo --preserve-env=DISPLAY,WAYLAND_DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR "$0" "$@"
 fi
 
-# -----------------------------------------------------------------------------
-# Terminal colors
-# -----------------------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -93,10 +84,9 @@ HHD_SETTINGS=(
     "gamemode.battery.charge_bypass=awake"
 )
 
-# Steam setup
 STEAM_DESKTOP_SRC="/var/lib/flatpak/exports/share/applications/org.anatase.Steam.Silent.desktop"
 STEAM_DESKTOP_NAME="org.anatase.Steam.Silent.desktop"
-STEAM_RULE_UUID="94ba89ad-c6f6-41ba-9d44-4113517758ff"
+STEAM_RULE_DESCRIPTION="Window settings for Steam Keyboard"
 
 # -----------------------------------------------------------------------------
 # State
@@ -142,27 +132,45 @@ get_real_home() {
     eval echo "~$user"
 }
 
-# Read a variable from the environment of a running session process.
-# KWin (and its Xwayland) sets the true DISPLAY / WAYLAND_DISPLAY /
-# XAUTHORITY for this user's graphical session; our root shell does not have
-# them, and `su -` resets them again. Reading them from /proc fixes both.
 read_session_var() {
     local user="$1" var="$2"
-    local pid name
-    for name in kwin_wayland kwin_x11 Xwayland plasmashell; do
+    local uid pid name val
+
+    uid=$(id -u "$user" 2>/dev/null || echo "")
+
+    for name in plasmashell kwin_wayland kwin_x11 Xwayland xdg-desktop-portal-kde; do
         pid=$(pgrep -u "$user" -x "$name" 2>/dev/null | head -1)
-        [[ -n "$pid" ]] && break
+        [[ -z "$pid" ]] && continue
+        val=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+              | grep "^${var}=" | head -1 | cut -d= -f2-)
+        if [[ -n "$val" ]]; then
+            echo "$val"
+            return 0
+        fi
     done
-    [[ -z "$pid" ]] && return 1
-    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | grep "^${var}=" | head -1 | cut -d= -f2-
+
+    if [[ -n "$uid" ]]; then
+        val=$(sudo -u "$user" \
+                env XDG_RUNTIME_DIR="/run/user/$uid" \
+                systemctl --user show-environment 2>/dev/null \
+              | grep "^${var}=" | head -1 | cut -d= -f2-)
+        if [[ -n "$val" ]]; then
+            echo "$val"
+            return 0
+        fi
+    fi
+
+    if [[ "$var" == "XAUTHORITY" && -n "$uid" ]]; then
+        val=$(ls -1t /run/user/"$uid"/xauth_* 2>/dev/null | head -1 || true)
+        if [[ -n "$val" ]]; then
+            echo "$val"
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
-# Run a command as the real user, with the real graphical session variables
-# recovered from the running compositor. The old version hard-coded
-# XAUTHORITY="$home/.Xauthority", which is wrong on Plasma 6 + Wayland —
-# KWin writes xauth to /run/user/<uid>/xauth_<random>, so xprop silently
-# failed to connect and every window query returned nothing.
 steam_as_user() {
     local user home uid
     user=$(get_real_user)
@@ -186,13 +194,10 @@ steam_as_user() {
         "$@"
 }
 
-# X11 helper — always talks to the real session DISPLAY, no shell override.
 x11_as_user() {
     steam_as_user xprop "$@"
 }
 
-# Call a KWin DBus method. Errors are no longer swallowed silently — if
-# scripting is broken, we want it in the log.
 kwin_call() {
     local user home uid
     user=$(get_real_user)
@@ -203,6 +208,14 @@ kwin_call() {
         XDG_RUNTIME_DIR="/run/user/$uid" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
         busctl --user --quiet call org.kde.KWin "$@"
+}
+
+generate_uuid() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr 'A-Z' 'a-z'
+    else
+        cat /proc/sys/kernel/random/uuid
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -231,7 +244,7 @@ find_fp_controller() {
 }
 
 # -----------------------------------------------------------------------------
-# Stage: Preparation (hard gate — exits on failure)
+# Stage: Preparation
 # -----------------------------------------------------------------------------
 prepare() {
     if [[ ! -f /etc/os-release ]]; then
@@ -392,8 +405,42 @@ run_gamemode_stage() {
 # -----------------------------------------------------------------------------
 # Stage: HHD settings
 # -----------------------------------------------------------------------------
+
+hhd_get() {
+    local key="$1" out
+    out=$(hhdctl get "$key" 2>/dev/null | head -1) || return 1
+    [[ -z "$out" ]] && return 1
+    out="${out#"$key"=}"
+    out="${out#"$key": }"
+    out="${out#"$key":}"
+    out=$(printf '%s' "$out" | awk '{ sub(/^[ \t]+/,""); sub(/[ \t]+$/,""); print }')
+    out="${out#\"}"; out="${out%\"}"
+    out="${out#\'}"; out="${out%\'}"
+    printf '%s' "$out"
+}
+
+hhd_settings_match() {
+    local setting key expected current
+    for setting in "${HHD_SETTINGS[@]}"; do
+        key="${setting%%=*}"
+        expected="${setting#*=}"
+        if ! current=$(hhd_get "$key"); then
+            return 1
+        fi
+        if [[ "$current" != "$expected" ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 run_hhd_stage() {
     command -v hhdctl &>/dev/null || return 1
+
+    if hhd_settings_match; then
+        print_status "HHD settings" "not needed"
+        return 0
+    fi
 
     hhdctl set hhd.settings.reset=true &>/dev/null || return 1
     sleep "$HHD_RESET_DELAY"
@@ -411,56 +458,9 @@ run_hhd_stage() {
 # Steam helpers
 # -----------------------------------------------------------------------------
 
-# Dump all toplevel windows with their relevant properties — used for debug
-# when the keyboard window cannot be found. No 2>/dev/null: if xprop can't
-# connect, we want the error visible.
-dump_steam_windows() {
-    local win_list win wmclass name wmtype
-    echo "---- debug: session vars ----"
-    echo "  DISPLAY         = '$(read_session_var "$(get_real_user)" DISPLAY         || echo "<none>")'"
-    echo "  WAYLAND_DISPLAY = '$(read_session_var "$(get_real_user)" WAYLAND_DISPLAY || echo "<none>")'"
-    echo "  XAUTHORITY      = '$(read_session_var "$(get_real_user)" XAUTHORITY      || echo "<none>")'"
-    echo "  XDG_RUNTIME_DIR = '$(read_session_var "$(get_real_user)" XDG_RUNTIME_DIR || echo "<none>")'"
-
-    echo "---- debug: xprop -root _NET_CLIENT_LIST ----"
-    x11_as_user -root _NET_CLIENT_LIST || true
-
-    win_list=$(x11_as_user -root _NET_CLIENT_LIST \
-               | sed 's/.*# //' | tr ',' '\n' | tr -d ' ')
-
-    echo "---- debug: toplevel windows ----"
-    if [[ -z "$win_list" ]]; then
-        echo "  (empty — xprop could not enumerate windows)"
-    fi
-    for win in $win_list; do
-        [[ -n "$win" ]] || continue
-        wmclass=$(x11_as_user -id "$win" WM_CLASS \
-                  | sed 's/^[^=]*= //' | tr -d '"')
-        name=$(x11_as_user -id "$win" _NET_WM_NAME \
-               | sed 's/^[^=]*= //' | tr -d '"')
-        wmtype=$(x11_as_user -id "$win" _NET_WM_WINDOW_TYPE \
-                 | sed 's/^[^=]*= //')
-        echo "  win=$win wmclass='$wmclass' name='$name' type='$wmtype'"
-    done
-    echo "---------------------------------"
-}
-
-# Find the Steam on-screen keyboard window.
-#
-# The previous version was too strict: it required an exact WM_CLASS match,
-# a _NET_WM_WINDOW_TYPE_UTILITY, and a non-zero
-# _KDE_NET_WM_USER_CREATION_TIME. On Plasma 6 + Steam (Flatpak) none of the
-# three reliably hold at once:
-#   * WM_CLASS casing varies ("steamwebhelper"/"Steam" vs lowercase)
-#   * the keyboard is often a NORMAL/dialog window, not UTILITY
-#   * creation-time may be 0 or missing when the window is opened via
-#     steam://open/keyboard (no direct user click)
-#
-# New strategy: find steamwebhelper windows, prefer one whose title looks
-# like the on-screen keyboard, ignore the window type entirely.
 find_steam_keyboard_window() {
     local win_list win
-    win_list=$(x11_as_user -root _NET_CLIENT_LIST \
+    win_list=$(x11_as_user -root _NET_CLIENT_LIST 2>/dev/null \
                | sed 's/.*# //' | tr ',' '\n' | tr -d ' ')
 
     local candidates=()
@@ -469,7 +469,7 @@ find_steam_keyboard_window() {
         [[ -n "$win" ]] || continue
 
         local wmclass
-        wmclass=$(x11_as_user -id "$win" WM_CLASS \
+        wmclass=$(x11_as_user -id "$win" WM_CLASS 2>/dev/null \
                   | sed 's/^[^=]*= //' | tr -d '"' \
                   | tr 'A-Z' 'a-z' | tr -s ' ' | sed 's/^ //;s/ $//')
         case "$wmclass" in
@@ -478,7 +478,7 @@ find_steam_keyboard_window() {
         esac
 
         local name
-        name=$(x11_as_user -id "$win" _NET_WM_NAME \
+        name=$(x11_as_user -id "$win" _NET_WM_NAME 2>/dev/null \
                | sed 's/^[^=]*= //' | tr -d '"')
         [[ -n "$name" ]] || continue
 
@@ -493,17 +493,11 @@ find_steam_keyboard_window() {
         candidates+=("$win:$name")
     done
 
-    # No obvious keyboard title; if exactly one steamwebhelper window exists
-    # (typically after opening steam://open/keyboard), take it.
     if [[ ${#candidates[@]} -eq 1 ]]; then
         echo "${candidates[0]%%:*}"
         return 0
     fi
 
-    if [[ ${#candidates[@]} -gt 1 ]]; then
-        echo "Multiple steamwebhelper windows found:" >&2
-        printf '  %s\n' "${candidates[@]}" >&2
-    fi
     return 1
 }
 
@@ -527,14 +521,11 @@ close_window_by_caption() {
 EOF
     chmod 644 "$script_file"
 
-    local load_out start_out
-    load_out=$(kwin_call /Scripting org.kde.kwin.Scripting loadScript s "$script_file" 2>&1 || true)
-    start_out=$(kwin_call /Scripting org.kde.kwin.Scripting start 2>&1 || true)
-    echo "  kwin scripting loadScript: ${load_out:-<no output>}"
-    echo "  kwin scripting start:      ${start_out:-<no output>}"
+    kwin_call /Scripting org.kde.kwin.Scripting loadScript s "$script_file" &>/dev/null || true
+    kwin_call /Scripting org.kde.kwin.Scripting start &>/dev/null || true
 
     sleep 0.5
-    kwin_call /Scripting org.kde.kwin.Scripting unloadScript s "$script_name" 2>&1 || true
+    kwin_call /Scripting org.kde.kwin.Scripting unloadScript s "$script_name" &>/dev/null || true
 
     rm -f "$script_file"
     return 0
@@ -569,250 +560,228 @@ steam_ensure_kwinrc() {
 }
 
 # -----------------------------------------------------------------------------
-# Stage: Steam setup
+# KWin rule helpers (Steam keyboard)
 # -----------------------------------------------------------------------------
-run_steam_stage() {
-    local user home uid
-    user=$(get_real_user)
-    home=$(get_real_home)
-    uid=$(id -u "$user")
 
-    if ! command -v xprop >/dev/null 2>&1; then
-        STEAM_FAIL_REASON="xprop is not installed."
-        return 1
-    fi
-    if ! command -v busctl >/dev/null 2>&1; then
-        STEAM_FAIL_REASON="busctl is not installed."
-        return 1
-    fi
-    if ! command -v kwriteconfig6 >/dev/null 2>&1; then
-        STEAM_FAIL_REASON="kwriteconfig6 is not installed."
-        return 1
-    fi
+steam_rule_expected() {
+    local title="$1"
+    cat <<EOF
+above=true
+aboverule=2
+ignoregeometry=true
+ignoregeometryrule=2
+maximizehoriz=true
+maximizehorizrule=2
+opacityinactive=75
+opacityinactiverule=2
+position=0,238
+positionrule=2
+skiptaskbar=true
+skiptaskbarrule=2
+title=${title}
+titlematch=2
+wmclass=steam
+wmclasscomplete=true
+wmclassmatch=2
+EOF
+}
 
-    # ---- debug: session state once -----------------------------------------
-    local dbg_disp dbg_wl dbg_xauth dbg_rt
-    dbg_disp=$(read_session_var  "$user" DISPLAY         || echo "<none>")
-    dbg_wl=$(read_session_var    "$user" WAYLAND_DISPLAY || echo "<none>")
-    dbg_xauth=$(read_session_var "$user" XAUTHORITY      || echo "<none>")
-    dbg_rt=$(read_session_var    "$user" XDG_RUNTIME_DIR || echo "<none>")
-    echo "session: DISPLAY=$dbg_disp WAYLAND_DISPLAY=$dbg_wl XAUTHORITY=$dbg_xauth XDG_RUNTIME_DIR=$dbg_rt"
+steam_rule_expected_keys() {
+    steam_rule_expected "$1" | cut -d= -f1 | sort -u
+}
 
-    if ! x11_as_user -root _NET_CLIENT_LIST >/dev/null 2>&1; then
-        echo "WARN: xprop cannot talk to the X server with recovered session vars" >&2
-        x11_as_user -root _NET_CLIENT_LIST || true
-    fi
-
-    local changed=0
-
-    # ---- 1. Silent autostart -------------------------------------------------
-    local autostart_dir="${home}/.config/autostart"
-    local desktop_dst="${autostart_dir}/${STEAM_DESKTOP_NAME}"
-
-    if [[ ! -f "$desktop_dst" ]]; then
-        if [[ ! -f "$STEAM_DESKTOP_SRC" ]]; then
-            STEAM_FAIL_REASON="Source .desktop not found: $STEAM_DESKTOP_SRC"
-            return 1
-        fi
-        sudo -u "$user" mkdir -p "$autostart_dir"
-        sudo -u "$user" cp "$STEAM_DESKTOP_SRC" "$desktop_dst"
-        changed=1
-    fi
-
-    # ---- 2. kwinrc Xwayland entry -------------------------------------------
-    if steam_ensure_kwinrc; then
-        changed=1
-        reboot_needed=1
-    fi
-
-    # ---- 3. Launch Steam if not running -------------------------------------
-    if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
-        echo "Launching Steam (this may take a while)..."
-
-        local exec_line
-        exec_line=$(grep -m1 '^Exec=' "$STEAM_DESKTOP_SRC" 2>/dev/null | cut -d= -f2- || echo "")
-        if [[ -z "$exec_line" ]]; then
-            STEAM_FAIL_REASON="Steam failed to launch."
-            return 1
-        fi
-
-        exec_line=${exec_line//%U/}
-        exec_line=${exec_line//%u/}
-        exec_line=${exec_line//%F/}
-        exec_line=${exec_line//%f/}
-        exec_line=${exec_line//%i/}
-        exec_line=${exec_line//%c/}
-        exec_line=${exec_line//%k/}
-        exec_line=$(echo "$exec_line" | tr -s ' ' | sed 's/ $//')
-
-        local sess_display sess_wayland sess_xauth sess_runtime
-        sess_display=$(read_session_var "$user" DISPLAY         || echo "")
-        sess_wayland=$(read_session_var "$user" WAYLAND_DISPLAY || echo "")
-        sess_xauth=$(read_session_var   "$user" XAUTHORITY      || echo "")
-        sess_runtime=$(read_session_var "$user" XDG_RUNTIME_DIR || echo "/run/user/$uid")
-
-        sudo -u "$user" \
-            env HOME="$home" \
-                XDG_RUNTIME_DIR="$sess_runtime" \
-                DBUS_SESSION_BUS_ADDRESS="unix:path=${sess_runtime}/bus" \
-            systemd-run --user --quiet --collect \
-                --unit="steam-launch-$$" \
-                --setenv=DISPLAY="${sess_display:-:0}" \
-                --setenv=WAYLAND_DISPLAY="${sess_wayland:-wayland-0}" \
-                --setenv=XAUTHORITY="${sess_xauth:-$home/.Xauthority}" \
-                --setenv=XDG_CURRENT_DESKTOP=KDE \
-                -- $exec_line \
-            >/dev/null 2>&1 || true
-
-        for _ in $(seq 1 60); do
-            sleep 1
-            pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
-        done
-        sleep 5
-
-        if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
-            STEAM_FAIL_REASON="Steam failed to launch."
-            return 1
-        fi
-    fi
-
-    # ---- 4. Find keyboard window --------------------------------------------
-    local win=""
-    win=$(find_steam_keyboard_window 2>/dev/null || true)
-
-    if [[ -z "$win" ]]; then
-        steam_as_user steam "steam://open/keyboard" &>/dev/null &
-        for _ in $(seq 1 30); do
-            sleep 0.5
-            win=$(find_steam_keyboard_window 2>/dev/null || true)
-            [[ -n "$win" ]] && break
-        done
-    fi
-
-    if [[ -z "$win" ]]; then
-        dump_steam_windows >&2 || true
-        STEAM_FAIL_REASON="Steam keyboard window not found."
-        return 1
-    fi
-
-    echo "Steam keyboard window id: $win"
-
-    # ---- 5. Read title and close --------------------------------------------
-    local title
-    title=$(x11_as_user -id "$win" _NET_WM_NAME \
-            | sed 's/^[^=]*= //' | tr -d '"')
-    if [[ -z "$title" ]]; then
-        STEAM_FAIL_REASON="Steam keyboard window title unavailable."
-        return 1
-    fi
-
-    echo "Steam keyboard window title: '$title'"
-
-    close_window_by_caption "$title" || true
-
-    # ---- 6. Write KWin window rule ------------------------------------------
-    local existing_title
-    existing_title=$(steam_as_user kreadconfig6 --file kwinrulesrc \
-        --group "$STEAM_RULE_UUID" --key title --default "" 2>/dev/null || echo "")
-
-    if [[ "$existing_title" != "$title" ]]; then
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key Description "Window settings for Steam Keyboard"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key above "true"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key aboverule "2"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key ignoregeometry "true"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key ignoregeometryrule "2"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key maximizehoriz "true"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key maximizehorizrule "2"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityinactive "75"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityinactiverule "2"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key position "0,238"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key positionrule "2"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key skiptaskbar "true"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key skiptaskbarrule "2"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key title "$title"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key titlematch "2"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclass "steam"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclasscomplete "true"
-        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key wmclassmatch "2"
-
-        local rules
-        rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
-            --key rules --default "" 2>/dev/null || echo "")
-        if [[ ",$rules," != *",$STEAM_RULE_UUID,"* ]]; then
-            if [[ -z "$rules" ]]; then
-                steam_as_user kwriteconfig6 --file kwinrulesrc --group General --key rules "$STEAM_RULE_UUID"
-            else
-                steam_as_user kwriteconfig6 --file kwinrulesrc --group General --key rules "${rules},${STEAM_RULE_UUID}"
-            fi
-        fi
-
-        kwin_call /KWin org.kde.KWin reconfigure 2>&1 || true
-
-        changed=1
-    fi
-
-    if [[ $changed -eq 1 ]]; then
-        print_status "Steam setup" "done"
-    else
-        print_status "Steam setup" "not needed"
-    fi
+steam_rule_params_ok() {
+    local uuid="$1" title="$2" line key expected current
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        key="${line%%=*}"
+        expected="${line#*=}"
+        current=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$uuid" --key "$key" --default "" 2>/dev/null || echo "")
+        [[ "$current" == "$expected" ]] || return 1
+    done < <(steam_rule_expected "$title")
     return 0
 }
 
+steam_rule_no_extra_keys() {
+    local uuid="$1" title="$2"
+    local kwinrulesrc expected present k
+    kwinrulesrc="$(get_real_home)/.config/kwinrulesrc"
+    [[ -f "$kwinrulesrc" ]] || return 0
+
+    expected=$(steam_rule_expected_keys "$title")
+    present=$(awk -v g="[$uuid]" '
+        $0 == g { s=1; next }
+        /^\[/ { s=0 }
+        s && /^[^=]+=/ { sub(/=.*/, ""); print }
+    ' "$kwinrulesrc" | sort -u)
+
+    while IFS= read -r k; do
+        [[ -n "$k" ]] || continue
+        [[ "$k" == "Description" ]] && continue
+        if ! grep -qxF "$k" <<< "$expected"; then
+            return 1
+        fi
+    done <<< "$present"
+    return 0
+}
+
+steam_rule_find_by_title() {
+    local title="$1" uuid rule_title rules
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+    IFS=',' read -ra _arr <<< "$rules"
+    for uuid in "${_arr[@]}"; do
+        [[ -n "$uuid" ]] || continue
+        rule_title=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$uuid" --key title --default "" 2>/dev/null || echo "")
+        if [[ "$rule_title" == "$title" ]]; then
+            echo "$uuid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+steam_rule_find_by_description() {
+    local description="$1" uuid rule_desc rules
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+    IFS=',' read -ra _arr <<< "$rules"
+    for uuid in "${_arr[@]}"; do
+        [[ -n "$uuid" ]] || continue
+        rule_desc=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$uuid" --key Description --default "" 2>/dev/null || echo "")
+        if [[ "$rule_desc" == "$description" ]]; then
+            echo "$uuid"
+        fi
+    done
+}
+
 # -----------------------------------------------------------------------------
-# Main
+# Direct kwinrulesrc manipulation.
+#
+# kwriteconfig6 --group X --delete ненадёжен в этом окружении: группа
+# остаётся в файле. Поэтому удаляем группу и запись в rules= напрямую
+# через awk, атомарно переписывая файл. Возвращаем 0, если файл
+# действительно изменился.
 # -----------------------------------------------------------------------------
-if prepare; then
-    print_status "Preparation" "done"
-    stages_ok=$((stages_ok + 1))
-else
-    print_status "Preparation" "error" "$PREP_FAIL_REASON"
-    echo -e "${RED}All fixes failed to install.${NC}"
-    exit 1
-fi
+kwinrules_remove_uuid() {
+    local uuid="$1"
+    local user home file tmp mode
 
-if run_fingerprint_stage; then
-    stages_ok=$((stages_ok + 1))
-else
-    print_status "Fingerprint sensor tweaks" "error" "$FP_FAIL_REASON"
-    stages_error=$((stages_error + 1))
-fi
+    user=$(get_real_user)
+    home=$(get_real_home)
+    file="${home}/.config/kwinrulesrc"
 
-if run_gamemode_stage; then
-    stages_ok=$((stages_ok + 1))
-else
-    print_status "Gamemode shortcut" "error"
-    stages_error=$((stages_error + 1))
-fi
+    [[ -f "$file" ]] || return 1
 
-if run_hhd_stage; then
-    stages_ok=$((stages_ok + 1))
-else
-    print_status "HHD settings" "error"
-    stages_error=$((stages_error + 1))
-fi
+    mode=$(stat -c '%a' "$file" 2>/dev/null || echo "600")
+    tmp=$(mktemp) || return 1
 
-if run_steam_stage; then
-    stages_ok=$((stages_ok + 1))
-else
-    print_status "Steam setup" "error" "$STEAM_FAIL_REASON"
-    stages_error=$((stages_error + 1))
-fi
+    if ! awk -v uuid="$uuid" -v target="[$uuid]" '
+        BEGIN { skip = 0; in_general = 0 }
+        /^\[General\][[:space:]]*$/ { in_general = 1; print; next }
+        /^\[/ {
+            in_general = 0
+            if ($0 == target) { skip = 1; next }
+            skip = 0
+            print
+            next
+        }
+        skip { next }
+        in_general && /^rules[[:space:]]*=/ {
+            eq = index($0, "=")
+            val = substr($0, eq + 1)
+            n = split(val, uuids, ",")
+            new_val = ""
+            for (i = 1; i <= n; i++) {
+                gsub(/^[[:space:]]+/, "", uuids[i])
+                gsub(/[[:space:]]+$/, "", uuids[i])
+                if (uuids[i] == "" || uuids[i] == uuid) continue
+                if (new_val == "") new_val = uuids[i]
+                else new_val = new_val "," uuids[i]
+            }
+            print "rules=" new_val
+            next
+        }
+        { print }
+    ' "$file" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
 
-# -----------------------------------------------------------------------------
-# Final report
-# -----------------------------------------------------------------------------
-if [[ $stages_error -eq 0 ]]; then
-    echo -e "${GREEN}All fixes installed successfully.${NC}"
-elif [[ $stages_ok -eq 1 ]]; then
-    echo -e "${RED}All fixes failed to install.${NC}"
-else
-    echo -e "${YELLOW}Completed with errors.${NC}"
-fi
+    # Ничего не изменилось?
+    if cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
 
-if [[ $reboot_needed -eq 1 ]]; then
-    echo -e "${YELLOW}Reboot required to apply some fixes.${NC}"
-fi
-if [[ $bios_needed -eq 1 ]]; then
-    echo -e "${YELLOW}Also, ensure BIOS setting: Advanced -> ACPI Settings -> Enable ACPI Auto Configuration -> Enabled${NC}"
-fi
+    chmod "$mode" "$tmp" 2>/dev/null || true
+    chown "$user":"$user" "$tmp" 2>/dev/null || true
+
+    # Перезаписываем in-place (tee), чтобы сохранить inode и не сломать
+    # file watcher у KConfig.
+    if ! sudo -u "$user" tee "$file" < "$tmp" > /dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    rm -f "$tmp"
+    return 0
+}
+
+steam_rule_delete() {
+    kwinrules_remove_uuid "$1"
+}
+
+steam_rule_delete_orphans() {
+    local kwinrulesrc rules groups group desc title ltitle changed=0
+    kwinrulesrc="$(get_real_home)/.config/kwinrulesrc"
+    [[ -f "$kwinrulesrc" ]] || return 0
+
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+
+    groups=$(grep -E '^\[' "$kwinrulesrc" | sed 's/^\[//;s/\]$//')
+
+    while IFS= read -r group; do
+        [[ -n "$group" ]] || continue
+        [[ "$group" == "General" ]] && continue
+
+        [[ ",$rules," == *",$group,"* ]] && continue
+
+        [[ "$group" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+            || continue
+
+        desc=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$group" --key Description --default "" 2>/dev/null || echo "")
+        title=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$group" --key title --default "" 2>/dev/null || echo "")
+
+        ltitle="${title,,}"
+
+        local is_ours=0
+        [[ "$desc" == "$STEAM_RULE_DESCRIPTION" ]] && is_ours=1
+        if [[ "$ltitle" == *keyboard* || "$ltitle" == *клавиатура* ]]; then
+            is_ours=1
+        fi
+        [[ $is_ours -eq 1 ]] || continue
+
+        if kwinrules_remove_uuid "$group"; then
+            changed=1
+        fi
+    done <<< "$groups"
+
+    [[ $changed -eq 1 ]]
+}
+
+steam_rule_write() {
+    local uuid="$1" title="$2" line key val rules
+    steam_as_user kwriteconfig6 --file kwinrulesrc \
+        --group "$uuid" --key Description "$STEAM_RULE_DESCRIPTION"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        steam_as_user kwriteconfig6 --file kwin
