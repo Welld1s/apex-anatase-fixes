@@ -16,10 +16,10 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.10
+# Version: 1.3.11
 # =============================================================================
 
-SCRIPT_VERSION="1.3.10"
+SCRIPT_VERSION="1.3.11"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 echo "============================"
 
@@ -590,6 +590,14 @@ steam_rule_expected_keys() {
     steam_rule_expected "$1" | cut -d= -f1 | sort -u
 }
 
+# Хэш kwinrulesrc — используется для проверки «файл реально изменился?»
+steam_rule_hash() {
+    local kwinrulesrc
+    kwinrulesrc="$(get_real_home)/.config/kwinrulesrc"
+    [[ -f "$kwinrulesrc" ]] || { echo ""; return 0; }
+    sha256sum "$kwinrulesrc" | cut -d' ' -f1
+}
+
 # Список всех UUID-секций, физически присутствующих в kwinrulesrc
 steam_rule_list_all_uuids() {
     local kwinrulesrc
@@ -699,6 +707,15 @@ steam_rule_delete() {
     mv "$tmp" "$kwinrulesrc"
 }
 
+# Обёртка: удалить правило и вернуть 0 только если файл реально изменился
+steam_rule_delete_checked() {
+    local uuid="$1" before after
+    before=$(steam_rule_hash)
+    steam_rule_delete "$uuid"
+    after=$(steam_rule_hash)
+    [[ "$before" != "$after" ]]
+}
+
 steam_rule_reconcile() {
     local uuid="$1" title="$2"
     local kwinrulesrc current_keys expected_keys k line key val rules
@@ -738,7 +755,7 @@ steam_rule_reconcile() {
             --group "$uuid" --key "$key" "$val"
     done < <(steam_rule_expected "$title")
 
-    # 5. На всякий случай убедиться, что UUID есть в [General] rules
+    # 5. Убедиться, что UUID есть в [General] rules
     rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
         --key rules --default "" 2>/dev/null || echo "")
     if [[ ",$rules," != *",$uuid,"* ]]; then
@@ -957,7 +974,7 @@ run_steam_stage() {
 
     # ---- 6. Reconcile KWin window rule --------------------------------------
     # Кандидатов ищем по ВСЕМ секциям kwinrulesrc, а не только по [General] rules.
-    # Дальше:
+    # Логика:
     #   * совпал title/Description и есть в [General] → оставляем (один),
     #     остальные дубликаты — удаляем;
     #   * совпал title/Description, но НЕТ в [General] → удаляем и создаём своё.
@@ -986,16 +1003,20 @@ run_steam_stage() {
     for u in "${uniq[@]}"; do
         if [[ ",$general_rules," != *",$u,"* ]]; then
             # Правило найдено по title/Description, но потеряло запись в [General]:
-            # удаляем и позже создадим своё.
-            steam_rule_delete "$u"
-            rule_changed=1
+            # удаляем и позже создадим своё. Флаг rule_changed выставляем
+            # только если файл реально изменился.
+            if steam_rule_delete_checked "$u"; then
+                rule_changed=1
+            fi
             continue
         fi
         if [[ -z "$kept" ]]; then
             kept="$u"
         else
-            steam_rule_delete "$u"
-            rule_changed=1
+            # Дубликат — удаляем. Флаг rule_changed выставляем по факту.
+            if steam_rule_delete_checked "$u"; then
+                rule_changed=1
+            fi
         fi
     done
 
