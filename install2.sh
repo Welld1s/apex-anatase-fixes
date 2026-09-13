@@ -784,4 +784,274 @@ steam_rule_write() {
         [[ -n "$line" ]] || continue
         key="${line%%=*}"
         val="${line#*=}"
-        steam_as_user kwriteconfig6 --file kwin
+        steam_as_user kwriteconfig6 --file kwinrulesrc \
+            --group "$uuid" --key "$key" "$val"
+    done < <(steam_rule_expected "$title")
+
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+    if [[ ",$rules," != *",$uuid,"* ]]; then
+        if [[ -z "$rules" ]]; then
+            steam_as_user kwriteconfig6 --file kwinrulesrc --group General \
+                --key rules "$uuid"
+        else
+            steam_as_user kwriteconfig6 --file kwinrulesrc --group General \
+                --key rules "${rules},${uuid}"
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Stage: Steam setup
+# -----------------------------------------------------------------------------
+run_steam_stage() {
+    local user home uid
+    user=$(get_real_user)
+    home=$(get_real_home)
+    uid=$(id -u "$user")
+
+    if ! command -v flatpak >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="flatpak is not installed."
+        return 1
+    fi
+
+    if ! flatpak info org.anatase.Steam >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="Steam is not installed. Enter Gamemode at least once for installation."
+        return 1
+    fi
+
+    if ! command -v xprop >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="xprop is not installed."
+        return 1
+    fi
+    if ! command -v busctl >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="busctl is not installed."
+        return 1
+    fi
+    if ! command -v kwriteconfig6 >/dev/null 2>&1; then
+        STEAM_FAIL_REASON="kwriteconfig6 is not installed."
+        return 1
+    fi
+
+    local changed=0
+
+    # ---- 1. Silent autostart -------------------------------------------------
+    local autostart_dir="${home}/.config/autostart"
+    local desktop_dst="${autostart_dir}/${STEAM_DESKTOP_NAME}"
+
+    if [[ ! -f "$desktop_dst" ]]; then
+        if [[ ! -f "$STEAM_DESKTOP_SRC" ]]; then
+            STEAM_FAIL_REASON="Source .desktop not found: $STEAM_DESKTOP_SRC"
+            return 1
+        fi
+        sudo -u "$user" mkdir -p "$autostart_dir"
+        sudo -u "$user" cp "$STEAM_DESKTOP_SRC" "$desktop_dst"
+        changed=1
+    fi
+
+    # ---- 2. kwinrc Xwayland entry -------------------------------------------
+    if steam_ensure_kwinrc; then
+        changed=1
+        reboot_needed=1
+    fi
+
+    # ---- 3. Launch Steam if not running -------------------------------------
+    if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
+        echo "Launching Steam (this may take a while)..."
+
+        local exec_line
+        exec_line=$(grep -m1 '^Exec=' "$STEAM_DESKTOP_SRC" 2>/dev/null | cut -d= -f2- || echo "")
+        if [[ -z "$exec_line" ]]; then
+            STEAM_FAIL_REASON="Steam failed to launch."
+            return 1
+        fi
+
+        exec_line=${exec_line//%U/}
+        exec_line=${exec_line//%u/}
+        exec_line=${exec_line//%F/}
+        exec_line=${exec_line//%f/}
+        exec_line=${exec_line//%i/}
+        exec_line=${exec_line//%c/}
+        exec_line=${exec_line//%k/}
+        exec_line=$(echo "$exec_line" | tr -s ' ' | sed 's/ $//')
+
+        local sess_display sess_wayland sess_xauth sess_runtime
+        sess_display=$(read_session_var "$user" DISPLAY         || echo "")
+        sess_wayland=$(read_session_var "$user" WAYLAND_DISPLAY || echo "")
+        sess_xauth=$(read_session_var   "$user" XAUTHORITY      || echo "")
+        sess_runtime=$(read_session_var "$user" XDG_RUNTIME_DIR || echo "/run/user/$uid")
+
+        sudo -u "$user" \
+            env HOME="$home" \
+                XDG_RUNTIME_DIR="$sess_runtime" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${sess_runtime}/bus" \
+            systemd-run --user --quiet --collect \
+                --unit="steam-launch-$$" \
+                --setenv=DISPLAY="${sess_display:-:0}" \
+                --setenv=WAYLAND_DISPLAY="${sess_wayland:-wayland-0}" \
+                --setenv=XAUTHORITY="${sess_xauth:-$home/.Xauthority}" \
+                --setenv=XDG_CURRENT_DESKTOP=KDE \
+                -- $exec_line \
+            >/dev/null 2>&1 || true
+
+        for _ in $(seq 1 60); do
+            sleep 1
+            pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1 && break
+        done
+        sleep 5
+
+        if ! pgrep -u "$user" -f "steamwebhelper" >/dev/null 2>&1; then
+            STEAM_FAIL_REASON="Steam failed to launch."
+            return 1
+        fi
+    fi
+
+    # ---- 4. Find keyboard window --------------------------------------------
+    local win=""
+    win=$(find_steam_keyboard_window 2>/dev/null || true)
+
+    if [[ -z "$win" ]]; then
+        steam_as_user steam "steam://open/keyboard" &>/dev/null &
+        for _ in $(seq 1 30); do
+            sleep 0.5
+            win=$(find_steam_keyboard_window 2>/dev/null || true)
+            [[ -n "$win" ]] && break
+        done
+    fi
+
+    if [[ -z "$win" ]]; then
+        STEAM_FAIL_REASON="Steam keyboard window not found."
+        return 1
+    fi
+
+    # ---- 5. Read title and close --------------------------------------------
+    local title
+    title=$(x11_as_user -id "$win" _NET_WM_NAME 2>/dev/null \
+            | sed 's/^[^=]*= //' | tr -d '"')
+    if [[ -z "$title" ]]; then
+        STEAM_FAIL_REASON="Steam keyboard window title unavailable."
+        return 1
+    fi
+
+    close_window_by_caption "$title" || true
+
+    # ---- 6. Reconcile KWin window rule --------------------------------------
+    local candidates=() u
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && candidates+=("$u")
+    done < <(steam_rule_find_by_title "$title" 2>/dev/null || true)
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && candidates+=("$u")
+    done < <(steam_rule_find_by_description "$STEAM_RULE_DESCRIPTION" 2>/dev/null || true)
+
+    local -A seen=()
+    local uniq=()
+    for u in "${candidates[@]}"; do
+        [[ -n "${seen[$u]:-}" ]] && continue
+        seen[$u]=1
+        uniq+=("$u")
+    done
+
+    local kept=""
+    local rule_changed=0
+    for u in "${uniq[@]}"; do
+        if [[ -z "$kept" ]] \
+           && steam_rule_params_ok "$u" "$title" \
+           && steam_rule_no_extra_keys "$u" "$title"; then
+            kept="$u"
+            continue
+        fi
+        if steam_rule_delete "$u"; then
+            rule_changed=1
+        fi
+    done
+
+    if [[ -z "$kept" ]]; then
+        steam_rule_write "$(generate_uuid)" "$title"
+        rule_changed=1
+    else
+        local cur_desc
+        cur_desc=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$kept" --key Description --default "" 2>/dev/null || echo "")
+        if [[ "$cur_desc" != "$STEAM_RULE_DESCRIPTION" ]]; then
+            steam_as_user kwriteconfig6 --file kwinrulesrc \
+                --group "$kept" --key Description "$STEAM_RULE_DESCRIPTION"
+            rule_changed=1
+        fi
+    fi
+
+    # ---- 7. Remove orphaned rule groups -------------------------------------
+    if steam_rule_delete_orphans; then
+        rule_changed=1
+    fi
+
+    if [[ $rule_changed -eq 1 ]]; then
+        kwin_call /KWin org.kde.KWin reconfigure &>/dev/null || true
+        changed=1
+    fi
+
+    if [[ $changed -eq 1 ]]; then
+        print_status "Steam setup" "done"
+    else
+        print_status "Steam setup" "not needed"
+    fi
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+if prepare; then
+    print_status "Preparation" "done"
+    stages_ok=$((stages_ok + 1))
+else
+    print_status "Preparation" "error" "$PREP_FAIL_REASON"
+    echo -e "${RED}All fixes failed to install.${NC}"
+    exit 1
+fi
+
+if run_fingerprint_stage; then
+    stages_ok=$((stages_ok + 1))
+else
+    print_status "Fingerprint sensor tweaks" "error" "$FP_FAIL_REASON"
+    stages_error=$((stages_error + 1))
+fi
+
+if run_gamemode_stage; then
+    stages_ok=$((stages_ok + 1))
+else
+    print_status "Gamemode shortcut" "error"
+    stages_error=$((stages_error + 1))
+fi
+
+if run_hhd_stage; then
+    stages_ok=$((stages_ok + 1))
+else
+    print_status "HHD settings" "error"
+    stages_error=$((stages_error + 1))
+fi
+
+if run_steam_stage; then
+    stages_ok=$((stages_ok + 1))
+else
+    print_status "Steam setup" "error" "$STEAM_FAIL_REASON"
+    stages_error=$((stages_error + 1))
+fi
+
+# -----------------------------------------------------------------------------
+# Final report
+# -----------------------------------------------------------------------------
+if [[ $stages_error -eq 0 ]]; then
+    echo -e "${GREEN}All fixes installed successfully.${NC}"
+elif [[ $stages_ok -eq 1 ]]; then
+    echo -e "${RED}All fixes failed to install.${NC}"
+else
+    echo -e "${YELLOW}Completed with errors.${NC}"
+fi
+
+if [[ $reboot_needed -eq 1 ]]; then
+    echo -e "${YELLOW}Reboot required to apply some fixes.${NC}"
+fi
+if [[ $bios_needed -eq 1 ]]; then
+    echo -e "${YELLOW}Also, ensure BIOS setting: Advanced -> ACPI Settings -> Enable ACPI Auto Configuration -> Enabled${NC}"
+fi
