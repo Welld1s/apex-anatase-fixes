@@ -16,10 +16,10 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.5
+# Version: 1.3.6
 # =============================================================================
 
-SCRIPT_VERSION="1.3.5"
+SCRIPT_VERSION="1.3.6"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 echo "============================"
 
@@ -678,6 +678,47 @@ steam_rule_delete() {
         --delete-group 2>/dev/null || true
 }
 
+steam_rule_delete_orphans() {
+    local kwinrulesrc rules groups group desc title ltitle changed=0
+    kwinrulesrc="$(get_real_home)/.config/kwinrulesrc"
+    [[ -f "$kwinrulesrc" ]] || return 0
+
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+
+    groups=$(grep -E '^\[' "$kwinrulesrc" | sed 's/^\[//;s/\]$//')
+
+    while IFS= read -r group; do
+        [[ -n "$group" ]] || continue
+        [[ "$group" == "General" ]] && continue
+
+        [[ ",$rules," == *",$group,"* ]] && continue
+
+        [[ "$group" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+            || continue
+
+        desc=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$group" --key Description --default "" 2>/dev/null || echo "")
+        title=$(steam_as_user kreadconfig6 --file kwinrulesrc \
+            --group "$group" --key title --default "" 2>/dev/null || echo "")
+
+        ltitle="${title,,}"
+
+        local is_ours=0
+        [[ "$desc" == "$STEAM_RULE_DESCRIPTION" ]] && is_ours=1
+        if [[ "$ltitle" == *keyboard* || "$ltitle" == *клавиатура* ]]; then
+            is_ours=1
+        fi
+        [[ $is_ours -eq 1 ]] || continue
+
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$group" \
+            --delete-group 2>/dev/null || true
+        changed=1
+    done <<< "$groups"
+
+    [[ $changed -eq 1 ]]
+}
+
 steam_rule_write() {
     local uuid="$1" title="$2" line key val rules
     steam_as_user kwriteconfig6 --file kwinrulesrc \
@@ -879,6 +920,11 @@ run_steam_stage() {
                 --group "$kept" --key Description "$STEAM_RULE_DESCRIPTION"
             rule_changed=1
         fi
+    fi
+
+    # ---- 7. Remove orphaned rule groups -------------------------------------
+    if steam_rule_delete_orphans; then
+        rule_changed=1
     fi
 
     if [[ $rule_changed -eq 1 ]]; then
