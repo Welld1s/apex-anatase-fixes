@@ -16,10 +16,10 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.6
+# Version: 1.3.7
 # =============================================================================
 
-SCRIPT_VERSION="1.3.6"
+SCRIPT_VERSION="1.3.7"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 echo "============================"
 
@@ -674,8 +674,11 @@ steam_rule_delete() {
     done
     steam_as_user kwriteconfig6 --file kwinrulesrc --group General \
         --key rules "$new_rules" 2>/dev/null || true
+    # kwriteconfig6 удаляет группу через --delete (без --key).
+    # Ранее здесь ошибочно использовался --delete-group, из-за чего
+    # блоки правил накапливались в kwinrulesrc.
     steam_as_user kwriteconfig6 --file kwinrulesrc --group "$uuid" \
-        --delete-group 2>/dev/null || true
+        --delete 2>/dev/null || true
 }
 
 steam_rule_delete_orphans() {
@@ -711,8 +714,9 @@ steam_rule_delete_orphans() {
         fi
         [[ $is_ours -eq 1 ]] || continue
 
+        # См. комментарий в steam_rule_delete: используем --delete.
         steam_as_user kwriteconfig6 --file kwinrulesrc --group "$group" \
-            --delete-group 2>/dev/null || true
+            --delete 2>/dev/null || true
         changed=1
     done <<< "$groups"
 
