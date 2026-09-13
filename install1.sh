@@ -16,10 +16,10 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.8
+# Version: 1.3.10
 # =============================================================================
 
-SCRIPT_VERSION="1.3.8"
+SCRIPT_VERSION="1.3.10-1"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 echo "============================"
 
@@ -590,6 +590,15 @@ steam_rule_expected_keys() {
     steam_rule_expected "$1" | cut -d= -f1 | sort -u
 }
 
+# Список всех UUID-секций, физически присутствующих в kwinrulesrc
+steam_rule_list_all_uuids() {
+    local kwinrulesrc
+    kwinrulesrc="$(get_real_home)/.config/kwinrulesrc"
+    [[ -f "$kwinrulesrc" ]] || return 0
+    grep -E '^\[' "$kwinrulesrc" | sed 's/^\[//;s/\]$//' \
+        | grep -Ei '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+}
+
 steam_rule_params_ok() {
     local uuid="$1" title="$2" line key expected current
     while IFS= read -r line; do
@@ -626,122 +635,134 @@ steam_rule_no_extra_keys() {
     return 0
 }
 
+# Ищем по title среди ВСЕХ секций файла (не только тех, что в [General] rules)
 steam_rule_find_by_title() {
-    local title="$1" uuid rule_title rules
-    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
-        --key rules --default "" 2>/dev/null || echo "")
-    IFS=',' read -ra _arr <<< "$rules"
-    for uuid in "${_arr[@]}"; do
+    local title="$1" uuid rule_title
+    while IFS= read -r uuid; do
         [[ -n "$uuid" ]] || continue
         rule_title=$(steam_as_user kreadconfig6 --file kwinrulesrc \
             --group "$uuid" --key title --default "" 2>/dev/null || echo "")
         if [[ "$rule_title" == "$title" ]]; then
             echo "$uuid"
-            return 0
         fi
-    done
-    return 1
+    done < <(steam_rule_list_all_uuids)
+    return 0
 }
 
+# Ищем по Description среди ВСЕХ секций файла
 steam_rule_find_by_description() {
-    local description="$1" uuid rule_desc rules
-    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
-        --key rules --default "" 2>/dev/null || echo "")
-    IFS=',' read -ra _arr <<< "$rules"
-    for uuid in "${_arr[@]}"; do
+    local description="$1" uuid rule_desc
+    while IFS= read -r uuid; do
         [[ -n "$uuid" ]] || continue
         rule_desc=$(steam_as_user kreadconfig6 --file kwinrulesrc \
             --group "$uuid" --key Description --default "" 2>/dev/null || echo "")
         if [[ "$rule_desc" == "$description" ]]; then
             echo "$uuid"
         fi
-    done
-}
-
-# -----------------------------------------------------------------------------
-# Direct kwinrulesrc manipulation.
-#
-# kwriteconfig6 --group X --delete ненадёжен в этом окружении: группа
-# остаётся в файле. Поэтому удаляем группу и запись в rules= напрямую
-# через awk, атомарно переписывая файл. Возвращаем 0, если файл
-# действительно изменился.
-# -----------------------------------------------------------------------------
-kwinrules_remove_uuid() {
-    local uuid="$1"
-    local user home file tmp mode
-
-    user=$(get_real_user)
-    home=$(get_real_home)
-    file="${home}/.config/kwinrulesrc"
-
-    [[ -f "$file" ]] || return 1
-
-    mode=$(stat -c '%a' "$file" 2>/dev/null || echo "600")
-    tmp=$(mktemp) || return 1
-
-    if ! awk -v uuid="$uuid" -v target="[$uuid]" '
-        BEGIN { skip = 0; in_general = 0 }
-        /^\[General\][[:space:]]*$/ { in_general = 1; print; next }
-        /^\[/ {
-            in_general = 0
-            if ($0 == target) { skip = 1; next }
-            skip = 0
-            print
-            next
-        }
-        skip { next }
-        in_general && /^rules[[:space:]]*=/ {
-            eq = index($0, "=")
-            val = substr($0, eq + 1)
-            n = split(val, uuids, ",")
-            new_val = ""
-            for (i = 1; i <= n; i++) {
-                gsub(/^[[:space:]]+/, "", uuids[i])
-                gsub(/[[:space:]]+$/, "", uuids[i])
-                if (uuids[i] == "" || uuids[i] == uuid) continue
-                if (new_val == "") new_val = uuids[i]
-                else new_val = new_val "," uuids[i]
-            }
-            print "rules=" new_val
-            next
-        }
-        { print }
-    ' "$file" > "$tmp"; then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    # Ничего не изменилось?
-    if cmp -s "$file" "$tmp"; then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    chmod "$mode" "$tmp" 2>/dev/null || true
-    chown "$user":"$user" "$tmp" 2>/dev/null || true
-
-    # Перезаписываем in-place (tee), чтобы сохранить inode и не сломать
-    # file watcher у KConfig.
-    if ! sudo -u "$user" tee "$file" < "$tmp" > /dev/null; then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    rm -f "$tmp"
+    done < <(steam_rule_list_all_uuids)
     return 0
 }
 
 steam_rule_delete() {
-    kwinrules_remove_uuid "$1"
-}
-
-steam_rule_delete_orphans() {
-    local kwinrulesrc rules groups group desc title ltitle changed=0
+    local uuid="$1" kwinrulesrc tmp rules new_rules r
     kwinrulesrc="$(get_real_home)/.config/kwinrulesrc"
     [[ -f "$kwinrulesrc" ]] || return 0
 
+    # 1. Убрать UUID из [General] rules (kwriteconfig6 это умеет)
     rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
         --key rules --default "" 2>/dev/null || echo "")
+    new_rules=""
+    IFS=',' read -ra _arr <<< "$rules"
+    for r in "${_arr[@]}"; do
+        [[ -n "$r" && "$r" != "$uuid" ]] || continue
+        if [[ -z "$new_rules" ]]; then
+            new_rules="$r"
+        else
+            new_rules="${new_rules},${r}"
+        fi
+    done
+    steam_as_user kwriteconfig6 --file kwinrulesrc --group General \
+        --key rules "$new_rules" 2>/dev/null || true
+
+    # 2. Вырезать секцию [UUID] напрямую из файла через awk.
+    #    kwriteconfig6 в KDE Plasma 6 не поддерживает --delete-group,
+    #    поэтому делаем это вручную, сохраняя владельца и права.
+    tmp=$(mktemp)
+    awk -v g="[$uuid]" '
+        $0 == g { skip=1; next }
+        /^\[/   { skip=0 }
+        !skip
+    ' "$kwinrulesrc" > "$tmp"
+
+    chown --reference="$kwinrulesrc" "$tmp" 2>/dev/null || true
+    chmod --reference="$kwinrulesrc" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$kwinrulesrc"
+}
+
+steam_rule_reconcile() {
+    local uuid="$1" title="$2"
+    local kwinrulesrc current_keys expected_keys k line key val rules
+
+    kwinrulesrc="$(get_real_home)/.config/kwinrulesrc"
+    [[ -f "$kwinrulesrc" ]] || return 1
+
+    expected_keys=$(steam_rule_expected_keys "$title")
+
+    # 1. Собрать список ключей, фактически присутствующих в секции
+    current_keys=$(awk -v g="[$uuid]" '
+        $0 == g { s=1; next }
+        /^\[/   { s=0 }
+        s && /^[^=]+=/ { sub(/=.*/, ""); print }
+    ' "$kwinrulesrc" | sort -u)
+
+    # 2. Удалить лишние ключи (кроме Description — его ставим явно ниже)
+    while IFS= read -r k; do
+        [[ -n "$k" ]] || continue
+        [[ "$k" == "Description" ]] && continue
+        if ! grep -qxF "$k" <<< "$expected_keys"; then
+            steam_as_user kwriteconfig6 --file kwinrulesrc \
+                --group "$uuid" --key "$k" --delete 2>/dev/null || true
+        fi
+    done <<< "$current_keys"
+
+    # 3. Description — всегда наш маркер
+    steam_as_user kwriteconfig6 --file kwinrulesrc \
+        --group "$uuid" --key Description "$STEAM_RULE_DESCRIPTION"
+
+    # 4. Записать/обновить все ожидаемые ключи
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        steam_as_user kwriteconfig6 --file kwinrulesrc \
+            --group "$uuid" --key "$key" "$val"
+    done < <(steam_rule_expected "$title")
+
+    # 5. На всякий случай убедиться, что UUID есть в [General] rules
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+    if [[ ",$rules," != *",$uuid,"* ]]; then
+        if [[ -z "$rules" ]]; then
+            steam_as_user kwriteconfig6 --file kwinrulesrc --group General \
+                --key rules "$uuid"
+        else
+            steam_as_user kwriteconfig6 --file kwinrulesrc --group General \
+                --key rules "${rules},${uuid}"
+        fi
+    fi
+
+    return 0
+}
+
+steam_rule_delete_orphans() {
+    local kwinrulesrc rules groups group desc title ltitle before after
+    kwinrulesrc="$(get_real_home)/.config/kwinrulesrc"
+    [[ -f "$kwinrulesrc" ]] || return 1
+
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+
+    before=$(sha256sum "$kwinrulesrc" | cut -d' ' -f1)
 
     groups=$(grep -E '^\[' "$kwinrulesrc" | sed 's/^\[//;s/\]$//')
 
@@ -768,12 +789,11 @@ steam_rule_delete_orphans() {
         fi
         [[ $is_ours -eq 1 ]] || continue
 
-        if kwinrules_remove_uuid "$group"; then
-            changed=1
-        fi
+        steam_rule_delete "$group"
     done <<< "$groups"
 
-    [[ $changed -eq 1 ]]
+    after=$(sha256sum "$kwinrulesrc" | cut -d' ' -f1)
+    [[ "$before" != "$after" ]]
 }
 
 steam_rule_write() {
@@ -936,6 +956,11 @@ run_steam_stage() {
     close_window_by_caption "$title" || true
 
     # ---- 6. Reconcile KWin window rule --------------------------------------
+    # Кандидатов ищем по ВСЕМ секциям kwinrulesrc, а не только по [General] rules.
+    # Дальше:
+    #   * совпал title/Description и есть в [General] → оставляем (один),
+    #     остальные дубликаты — удаляем;
+    #   * совпал title/Description, но НЕТ в [General] → удаляем и создаём своё.
     local candidates=() u
     while IFS= read -r u; do
         [[ -n "$u" ]] && candidates+=("$u")
@@ -952,16 +977,24 @@ run_steam_stage() {
         uniq+=("$u")
     done
 
-    local kept=""
+    local general_rules
+    general_rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+
     local rule_changed=0
+    local kept=""
     for u in "${uniq[@]}"; do
-        if [[ -z "$kept" ]] \
-           && steam_rule_params_ok "$u" "$title" \
-           && steam_rule_no_extra_keys "$u" "$title"; then
-            kept="$u"
+        if [[ ",$general_rules," != *",$u,"* ]]; then
+            # Правило найдено по title/Description, но потеряло запись в [General]:
+            # удаляем и позже создадим своё.
+            steam_rule_delete "$u"
+            rule_changed=1
             continue
         fi
-        if steam_rule_delete "$u"; then
+        if [[ -z "$kept" ]]; then
+            kept="$u"
+        else
+            steam_rule_delete "$u"
             rule_changed=1
         fi
     done
@@ -970,12 +1003,23 @@ run_steam_stage() {
         steam_rule_write "$(generate_uuid)" "$title"
         rule_changed=1
     else
-        local cur_desc
+        # Правило валидно и есть в [General] — не пересоздаём, а приводим
+        # к эталону in-place.
+        local need_reconcile=0 cur_desc
+        if ! steam_rule_params_ok "$kept" "$title"; then
+            need_reconcile=1
+        fi
+        if ! steam_rule_no_extra_keys "$kept" "$title"; then
+            need_reconcile=1
+        fi
         cur_desc=$(steam_as_user kreadconfig6 --file kwinrulesrc \
             --group "$kept" --key Description --default "" 2>/dev/null || echo "")
         if [[ "$cur_desc" != "$STEAM_RULE_DESCRIPTION" ]]; then
-            steam_as_user kwriteconfig6 --file kwinrulesrc \
-                --group "$kept" --key Description "$STEAM_RULE_DESCRIPTION"
+            need_reconcile=1
+        fi
+
+        if [[ $need_reconcile -eq 1 ]]; then
+            steam_rule_reconcile "$kept" "$title"
             rule_changed=1
         fi
     fi
