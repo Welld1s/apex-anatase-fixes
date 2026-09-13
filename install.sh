@@ -16,10 +16,10 @@ set -euo pipefail
 #
 #   The script is idempotent: it checks current state before making changes.
 #
-# Version: 1.3.8
+# Version: 1.3.9
 # =============================================================================
 
-SCRIPT_VERSION="1.3.8"
+SCRIPT_VERSION="1.3.9"
 echo "apex-anatase-fixes v$SCRIPT_VERSION"
 echo "============================"
 
@@ -658,81 +658,24 @@ steam_rule_find_by_description() {
     done
 }
 
-# -----------------------------------------------------------------------------
-# Direct kwinrulesrc manipulation.
-#
-# kwriteconfig6 --group X --delete ненадёжен в этом окружении: группа
-# остаётся в файле. Поэтому удаляем группу и запись в rules= напрямую
-# через awk, атомарно переписывая файл. Возвращаем 0, если файл
-# действительно изменился.
-# -----------------------------------------------------------------------------
-kwinrules_remove_uuid() {
-    local uuid="$1"
-    local user home file tmp mode
-
-    user=$(get_real_user)
-    home=$(get_real_home)
-    file="${home}/.config/kwinrulesrc"
-
-    [[ -f "$file" ]] || return 1
-
-    mode=$(stat -c '%a' "$file" 2>/dev/null || echo "600")
-    tmp=$(mktemp) || return 1
-
-    if ! awk -v uuid="$uuid" -v target="[$uuid]" '
-        BEGIN { skip = 0; in_general = 0 }
-        /^\[General\][[:space:]]*$/ { in_general = 1; print; next }
-        /^\[/ {
-            in_general = 0
-            if ($0 == target) { skip = 1; next }
-            skip = 0
-            print
-            next
-        }
-        skip { next }
-        in_general && /^rules[[:space:]]*=/ {
-            eq = index($0, "=")
-            val = substr($0, eq + 1)
-            n = split(val, uuids, ",")
-            new_val = ""
-            for (i = 1; i <= n; i++) {
-                gsub(/^[[:space:]]+/, "", uuids[i])
-                gsub(/[[:space:]]+$/, "", uuids[i])
-                if (uuids[i] == "" || uuids[i] == uuid) continue
-                if (new_val == "") new_val = uuids[i]
-                else new_val = new_val "," uuids[i]
-            }
-            print "rules=" new_val
-            next
-        }
-        { print }
-    ' "$file" > "$tmp"; then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    # Ничего не изменилось?
-    if cmp -s "$file" "$tmp"; then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    chmod "$mode" "$tmp" 2>/dev/null || true
-    chown "$user":"$user" "$tmp" 2>/dev/null || true
-
-    # Перезаписываем in-place (tee), чтобы сохранить inode и не сломать
-    # file watcher у KConfig.
-    if ! sudo -u "$user" tee "$file" < "$tmp" > /dev/null; then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    rm -f "$tmp"
-    return 0
-}
-
 steam_rule_delete() {
-    kwinrules_remove_uuid "$1"
+    local uuid="$1" rules new_rules r
+    rules=$(steam_as_user kreadconfig6 --file kwinrulesrc --group General \
+        --key rules --default "" 2>/dev/null || echo "")
+    new_rules=""
+    IFS=',' read -ra _arr <<< "$rules"
+    for r in "${_arr[@]}"; do
+        [[ -n "$r" && "$r" != "$uuid" ]] || continue
+        if [[ -z "$new_rules" ]]; then
+            new_rules="$r"
+        else
+            new_rules="${new_rules},${r}"
+        fi
+    done
+    steam_as_user kwriteconfig6 --file kwinrulesrc --group General \
+        --key rules "$new_rules" 2>/dev/null || true
+    steam_as_user kwriteconfig6 --file kwinrulesrc --group "$uuid" \
+        --delete-group 2>/dev/null || true
 }
 
 steam_rule_delete_orphans() {
@@ -768,9 +711,9 @@ steam_rule_delete_orphans() {
         fi
         [[ $is_ours -eq 1 ]] || continue
 
-        if kwinrules_remove_uuid "$group"; then
-            changed=1
-        fi
+        steam_as_user kwriteconfig6 --file kwinrulesrc --group "$group" \
+            --delete-group 2>/dev/null || true
+        changed=1
     done <<< "$groups"
 
     [[ $changed -eq 1 ]]
@@ -961,9 +904,8 @@ run_steam_stage() {
             kept="$u"
             continue
         fi
-        if steam_rule_delete "$u"; then
-            rule_changed=1
-        fi
+        steam_rule_delete "$u"
+        rule_changed=1
     done
 
     if [[ -z "$kept" ]]; then
