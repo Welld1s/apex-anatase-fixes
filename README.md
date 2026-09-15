@@ -59,7 +59,7 @@ This script wouldn't exist without the work of the following people:
 
 - **[antheas](https://github.com/antheas)** – for creating **Anatase OS** and **HHD**, the fantastic software that makes the OneXPlayer Apex truly shine.
 
-- **[srsholmes](https://github.com/srsholmes)** – for all the fixes. His research and code form the foundation of this script.
+- **[srsholmes](https://github.com/srsholmes)** – for the fingerprint sensor fix. His research and code form the foundation of this script.
 
 Thank you all for your contributions to the OneXPlayer community!
 
