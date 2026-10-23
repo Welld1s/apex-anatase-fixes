@@ -5,24 +5,20 @@ set -euo pipefail
 # apex-steamos-fingerprint-fix
 #
 # Fixes the OneXPlayer Apex fingerprint reader waking the device from sleep
-# on SteamOS. Extracted from apex-anatase-fixes v1.3.11.
+# on SteamOS.
 #
 # Fixes applied:
 #   1. Disable PCIe PME wake on the xHCI controller hosting the
 #      fingerprint reader (runtime sysfs + persistent udev rule).
 #   2. Add kernel argument to ignore the ACPI GPIO wake line:
 #      gpiolib_acpi.ignore_wake=AMDI0030:00@58
-#
-# The kernel argument is made persistent across SteamOS updates by hooking
-# into RAUC's post-install phase. A wrapper script calls the stock
-# post-install first, then re-applies the kernel argument to the newly
-# installed boot entries.
+#      (Applied via /etc/default/grub + update-grub, since SteamOS uses GRUB)
 #
 # The script is idempotent.
-# Version: 1.0.1
+# Version: 1.0.2
 # =============================================================================
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 echo "apex-steamos-fingerprint-fix v$SCRIPT_VERSION"
 echo "==========================================="
 
@@ -52,12 +48,7 @@ FP_UDEV_CONTENT='# Block wake from the xHCI controller hosting the FocalTech fin
 ACTION=="add", SUBSYSTEM=="pci", KERNEL=="%s", ATTR{power/wakeup}="disabled"
 '
 
-# RAUC hook paths (using /etc because it is persistent and writable on SteamOS)
-RAUC_CONF="/etc/rauc/system.conf"
-RAUC_STOCK_POSTINSTALL="/usr/lib/rauc/post-install.sh"
-RAUC_HOOK_DIR="/etc/rauc/apex-fingerprint-fix"
-RAUC_WRAPPER="${RAUC_HOOK_DIR}/rauc-post-install-wrapper.sh"
-RAUC_KARG_HOOK="${RAUC_HOOK_DIR}/add-kernel-arg.sh"
+GRUB_DEFAULT_FILE="/etc/default/grub"
 
 # -----------------------------------------------------------------------------
 # State
@@ -120,239 +111,48 @@ check_hardware() {
 }
 
 # -----------------------------------------------------------------------------
-# Kernel argument helper
+# Kernel argument helper (GRUB specific for SteamOS)
+# Returns: 0 = newly added, 1 = failed, 2 = already present
 # -----------------------------------------------------------------------------
 add_kernel_arg() {
     local karg="$1"
 
-    # Method 1: rpm-ostree (kept for compatibility, rarely used on SteamOS)
-    if command -v rpm-ostree >/dev/null 2>&1; then
-        local kargs
-        kargs=$(rpm-ostree kargs 2>/dev/null || echo "")
-        if [[ "$kargs" == *"$karg"* ]]; then
-            return 2
-        fi
-        if rpm-ostree kargs --append-if-missing="$karg" &>/dev/null; then
-            return 0
-        fi
+    # 1. Check if already in the config file
+    if grep -q "$karg" "$GRUB_DEFAULT_FILE" 2>/dev/null; then
+        return 2
     fi
 
-    # Method 2: GRUB (fallback)
-    if [[ -f /etc/default/grub ]]; then
-        local current
-        current=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub \
-                  | cut -d'"' -f2 || echo "")
-        if [[ "$current" == *"$karg"* ]]; then
-            return 2
-        fi
-        sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=\"\\(.*\\)\"|GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 $karg\"|" \
-            /etc/default/grub
-        if command -v update-grub >/dev/null 2>&1; then
-            update-grub &>/dev/null || true
-        elif command -v grub-mkconfig >/dev/null 2>&1; then
-            grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null || true
-        fi
-        return 0
-    fi
-
-    # Method 3: systemd-boot entries (SteamOS)
-    local entries_dir=""
-    for d in /boot/efi/loader/entries /boot/loader/entries; do
-        if [[ -d "$d" ]]; then
-            entries_dir="$d"
-            break
-        fi
-    done
-
-    if [[ -z "$entries_dir" ]]; then
+    # 2. Check if GRUB config exists
+    if [[ ! -f "$GRUB_DEFAULT_FILE" ]]; then
         return 1
     fi
 
-    local entry modified=0 total_with_options=0
-    for entry in "$entries_dir"/*.conf; do
-        [[ -f "$entry" ]] || continue
-        grep -q "^options " "$entry" || continue
-        total_with_options=$((total_with_options + 1))
-        if grep -q "$karg" "$entry"; then
-            continue
-        fi
-        [[ -f "${entry}.bak" ]] || cp "$entry" "${entry}.bak"
-        sed -i "s|^options \\(.*\\)|options \\1 $karg|" "$entry"
-        modified=1
-    done
+    # 3. Backup and modify
+    [[ -f "${GRUB_DEFAULT_FILE}.apex-fix.bak" ]] || cp "$GRUB_DEFAULT_FILE" "${GRUB_DEFAULT_FILE}.apex-fix.bak"
 
-    if [[ $total_with_options -eq 0 ]]; then
-        return 1
-    fi
-    if [[ $modified -eq 1 ]]; then
-        return 0
-    fi
-    return 2
-}
-
-# -----------------------------------------------------------------------------
-# Contents of the RAUC hook scripts
-# -----------------------------------------------------------------------------
-write_karg_hook() {
-    local tmp
-    tmp=$(mktemp)
-
-    cat > "$tmp" <<'HOOK_EOF'
-#!/usr/bin/env bash
-# Managed by apex-steamos-fingerprint-fix.sh
-# Called from the RAUC post-install wrapper to re-apply the fingerprint
-# wake kernel argument to the newly installed boot entries.
-set -euo pipefail
-
-FP_KARG="gpiolib_acpi.ignore_wake=AMDI0030:00@58"
-
-add_kernel_arg() {
-    local karg="$1"
-    local entries_dir=""
-    for d in /boot/efi/loader/entries /boot/loader/entries; do
-        if [[ -d "$d" ]]; then
-            entries_dir="$d"
-            break
-        fi
-    done
-
-    if [[ -z "$entries_dir" ]]; then
-        echo "apex-fingerprint-fix: no systemd-boot entries directory found" >&2
-        return 1
-    fi
-
-    local entry modified=0 total_with_options=0
-    for entry in "$entries_dir"/*.conf; do
-        [[ -f "$entry" ]] || continue
-        grep -q "^options " "$entry" || continue
-        total_with_options=$((total_with_options + 1))
-        if grep -q "$karg" "$entry"; then
-            continue
-        fi
-        [[ -f "${entry}.bak" ]] || cp "$entry" "${entry}.bak"
-        sed -i "s|^options \\(.*\\)|options \\1 $karg|" "$entry"
-        modified=1
-    done
-
-    if [[ $total_with_options -eq 0 ]]; then
-        echo "apex-fingerprint-fix: no boot entries with 'options' found" >&2
-        return 1
-    fi
-    if [[ $modified -eq 1 ]]; then
-        echo "apex-fingerprint-fix: kernel argument re-applied to boot entries"
-    fi
-    return 0
-}
-
-add_kernel_arg "$FP_KARG"
-HOOK_EOF
-
-    chmod 755 "$tmp"
-    mkdir -p "$(dirname "$RAUC_KARG_HOOK")"
-    if [[ ! -f "$RAUC_KARG_HOOK" ]] || ! cmp -s "$tmp" "$RAUC_KARG_HOOK"; then
-        cp "$tmp" "$RAUC_KARG_HOOK"
-        chmod 755 "$RAUC_KARG_HOOK"
-    fi
-    rm -f "$tmp"
-}
-
-write_wrapper_hook() {
-    local tmp
-    tmp=$(mktemp)
-
-    cat > "$tmp" <<WRAPPER_EOF
-#!/usr/bin/env bash
-# Managed by apex-steamos-fingerprint-fix.sh
-# Wrapper around SteamOS stock RAUC post-install.
-# Runs the stock hook first, then re-applies our kernel argument.
-set -euo pipefail
-
-STOCK="${RAUC_STOCK_POSTINSTALL}"
-OUR_HOOK="${RAUC_KARG_HOOK}"
-
-# Run the stock post-install if it exists (it almost certainly does).
-if [[ -x "\$STOCK" ]]; then
-    "\$STOCK" "\$@"
-else
-    echo "apex-fingerprint-fix: stock post-install not found at \$STOCK" >&2
-fi
-
-# Then apply our kernel argument fix.
-if [[ -x "\$OUR_HOOK" ]]; then
-    "\$OUR_HOOK" "\$@" || true
-fi
-WRAPPER_EOF
-
-    chmod 755 "$tmp"
-    mkdir -p "$(dirname "$RAUC_WRAPPER")"
-    if [[ ! -f "$RAUC_WRAPPER" ]] || ! cmp -s "$tmp" "$RAUC_WRAPPER"; then
-        cp "$tmp" "$RAUC_WRAPPER"
-        chmod 755 "$RAUC_WRAPPER"
-    fi
-    rm -f "$tmp"
-}
-
-# -----------------------------------------------------------------------------
-# Stage: RAUC post-install hook
-# -----------------------------------------------------------------------------
-run_rauc_hook_stage() {
-    local changed=0 failed=0
-
-    # ---- 1. Write the helper scripts to /etc/rauc/... ----------------------
-    if ! write_karg_hook; then
-        failed=1
-    fi
-    if ! write_wrapper_hook; then
-        failed=1
-    fi
-
-    # ---- 2. Patch /etc/rauc/system.conf ------------------------------------
-    if [[ $failed -eq 0 ]]; then
-        if [[ ! -f "$RAUC_CONF" ]]; then
-            print_status "RAUC post-install hook" "error" "$RAUC_CONF not found."
-            return 1
-        fi
-
-        # Check whether our wrapper is already configured.
-        if grep -q "post-install=${RAUC_WRAPPER}" "$RAUC_CONF" 2>/dev/null; then
-            changed=0  # already in place
-        else
-            # Back up once before first modification.
-            [[ -f "${RAUC_CONF}.apex-fix.bak" ]] || cp "$RAUC_CONF" "${RAUC_CONF}.apex-fix.bak"
-
-            # Replace the existing post-install line.
-            if grep -q '^post-install=' "$RAUC_CONF"; then
-                sed -i "s|^post-install=.*|post-install=${RAUC_WRAPPER}|" "$RAUC_CONF"
-            else
-                # Insert after [handlers] if present, otherwise append.
-                if grep -q '^\[handlers\]' "$RAUC_CONF"; then
-                    sed -i "/^\[handlers\]/a post-install=${RAUC_WRAPPER}" "$RAUC_CONF"
-                else
-                    printf '\n[handlers]\npost-install=%s\n' "$RAUC_WRAPPER" >> "$RAUC_CONF"
-                fi
-            fi
-            changed=1
-        fi
-    fi
-
-    # ---- 3. Restart RAUC so the new config is loaded -----------------------
-    if [[ $failed -eq 0 && $changed -eq 1 ]]; then
-        if systemctl restart rauc &>/dev/null; then
-            :
-        else
-            echo -e "${YELLOW}Warning: could not restart RAUC service; config will take effect on next boot.${NC}" >&2
-        fi
-    fi
-
-    if [[ $failed -eq 1 ]]; then
-        print_status "RAUC post-install hook" "error"
-        return 1
-    fi
-    if [[ $changed -eq 1 ]]; then
-        print_status "RAUC post-install hook" "done"
+    if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT_FILE"; then
+        sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=\"\\(.*\\)\"|GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 $karg\"|" "$GRUB_DEFAULT_FILE"
+    elif grep -q '^GRUB_CMDLINE_LINUX=' "$GRUB_DEFAULT_FILE"; then
+        sed -i "s|^GRUB_CMDLINE_LINUX=\"\\(.*\\)\"|GRUB_CMDLINE_LINUX=\"\\1 $karg\"|" "$GRUB_DEFAULT_FILE"
     else
-        print_status "RAUC post-install hook" "not needed"
+        echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$karg\"" >> "$GRUB_DEFAULT_FILE"
     fi
+
+    # 4. Rebuild GRUB config
+    local rebuild_ok=0
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub &>/dev/null && rebuild_ok=1
+    elif command -v grub-mkconfig >/dev/null 2>&1; then
+        # SteamOS usually places grub.cfg in the EFI partition
+        grub-mkconfig -o /boot/efi/EFI/steamos/grub.cfg &>/dev/null && rebuild_ok=1
+    fi
+
+    if [[ $rebuild_ok -eq 0 ]]; then
+        # Revert config if rebuild failed
+        cp "${GRUB_DEFAULT_FILE}.apex-fix.bak" "$GRUB_DEFAULT_FILE"
+        return 1
+    fi
+
     return 0
 }
 
@@ -377,6 +177,7 @@ print_status "Preparation" "done"
 changed=0
 fail_reason=""
 
+# 1. Runtime PME disable
 wake="/sys/bus/pci/devices/${controller}/power/wakeup"
 if [[ ! -f "$wake" ]]; then
     print_status "Fingerprint sensor tweaks" "error" "Wake path not accessible."
@@ -392,6 +193,7 @@ if [[ "$current" != "disabled" ]]; then
     fi
 fi
 
+# 2. Persistent udev rule
 need_update=1
 if [[ -f "$FP_UDEV_RULE" ]]; then
     grep -q "KERNEL==\"$controller\"" "$FP_UDEV_RULE" && need_update=0
@@ -406,6 +208,7 @@ if [[ $need_update -eq 1 ]]; then
     fi
 fi
 
+# 3. Kernel argument (GRUB)
 karg_rc=0
 add_kernel_arg "$FP_KARG" || karg_rc=$?
 if [[ $karg_rc -eq 0 ]]; then
@@ -424,9 +227,6 @@ else
     print_status "Fingerprint sensor tweaks" "not needed"
 fi
 
-# --- Stage: RAUC post-install hook -------------------------------------------
-run_rauc_hook_stage || true
-
 # -----------------------------------------------------------------------------
 # Final report
 # -----------------------------------------------------------------------------
@@ -439,8 +239,9 @@ if [[ $bios_needed -eq 1 ]]; then
     echo -e "${YELLOW}  Advanced -> ACPI Settings -> Enable ACPI Auto Configuration -> Enabled${NC}"
 fi
 if [[ $karg_failed -eq 1 ]]; then
-    echo -e "${YELLOW}WARNING: Could not automatically add kernel argument:${NC}"
-    echo -e "${YELLOW}  $FP_KARG${NC}"
-    echo -e "${YELLOW}The udev rule fix (PCIe PME) is still active, and the RAUC${NC}"
-    echo -e "${YELLOW}post-install hook has been installed to re-attempt on next update.${NC}"
+    echo -e "${YELLOW}WARNING: Could not automatically add kernel argument to GRUB.${NC}"
+    echo -e "${YELLOW}The udev rule fix (PCIe PME) is still active.${NC}"
+    echo -e "${YELLOW}To complete the fix manually:${NC}"
+    echo -e "${YELLOW}1. Edit /etc/default/grub and add '$FP_KARG' to GRUB_CMDLINE_LINUX_DEFAULT${NC}"
+    echo -e "${YELLOW}2. Run: sudo update-grub (or grub-mkconfig -o /boot/efi/EFI/steamos/grub.cfg)${NC}"
 fi
