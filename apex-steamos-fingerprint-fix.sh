@@ -15,10 +15,10 @@ set -euo pipefail
 #      (Applied via /etc/default/grub + update-grub, since SteamOS uses GRUB)
 #
 # The script is idempotent.
-# Version: 1.0.2
+# Version: 1.0.3
 # =============================================================================
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 echo "apex-steamos-fingerprint-fix v$SCRIPT_VERSION"
 echo "==========================================="
 
@@ -55,7 +55,9 @@ GRUB_DEFAULT_FILE="/etc/default/grub"
 # -----------------------------------------------------------------------------
 reboot_needed=0
 bios_needed=0
-karg_failed=0
+
+stages_ok=0
+stages_error=0
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -117,17 +119,14 @@ check_hardware() {
 add_kernel_arg() {
     local karg="$1"
 
-    # 1. Check if already in the config file
     if grep -q "$karg" "$GRUB_DEFAULT_FILE" 2>/dev/null; then
         return 2
     fi
 
-    # 2. Check if GRUB config exists
     if [[ ! -f "$GRUB_DEFAULT_FILE" ]]; then
         return 1
     fi
 
-    # 3. Backup and modify
     [[ -f "${GRUB_DEFAULT_FILE}.apex-fix.bak" ]] || cp "$GRUB_DEFAULT_FILE" "${GRUB_DEFAULT_FILE}.apex-fix.bak"
 
     if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT_FILE"; then
@@ -138,17 +137,14 @@ add_kernel_arg() {
         echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$karg\"" >> "$GRUB_DEFAULT_FILE"
     fi
 
-    # 4. Rebuild GRUB config
     local rebuild_ok=0
     if command -v update-grub >/dev/null 2>&1; then
         update-grub &>/dev/null && rebuild_ok=1
     elif command -v grub-mkconfig >/dev/null 2>&1; then
-        # SteamOS usually places grub.cfg in the EFI partition
         grub-mkconfig -o /boot/efi/EFI/steamos/grub.cfg &>/dev/null && rebuild_ok=1
     fi
 
     if [[ $rebuild_ok -eq 0 ]]; then
-        # Revert config if rebuild failed
         cp "${GRUB_DEFAULT_FILE}.apex-fix.bak" "$GRUB_DEFAULT_FILE"
         return 1
     fi
@@ -159,6 +155,7 @@ add_kernel_arg() {
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
+# --- Stage: Preparation ------------------------------------------------------
 if ! check_steamos; then
     print_status "Preparation" "error" "SteamOS not detected."
     exit 1
@@ -172,6 +169,7 @@ if ! controller=$(find_fp_controller); then
     exit 1
 fi
 print_status "Preparation" "done"
+stages_ok=$((stages_ok + 1))
 
 # --- Stage: Fingerprint fix --------------------------------------------------
 changed=0
@@ -181,67 +179,69 @@ fail_reason=""
 wake="/sys/bus/pci/devices/${controller}/power/wakeup"
 if [[ ! -f "$wake" ]]; then
     print_status "Fingerprint sensor tweaks" "error" "Wake path not accessible."
-    exit 1
-fi
-
-current=$(cat "$wake" 2>/dev/null || echo "")
-if [[ "$current" != "disabled" ]]; then
-    if echo "disabled" | tee "$wake" >/dev/null; then
-        changed=1
-    else
-        fail_reason="Failed to disable PME."
-    fi
-fi
-
-# 2. Persistent udev rule
-need_update=1
-if [[ -f "$FP_UDEV_RULE" ]]; then
-    grep -q "KERNEL==\"$controller\"" "$FP_UDEV_RULE" && need_update=0
-fi
-if [[ $need_update -eq 1 ]]; then
-    mkdir -p "$(dirname "$FP_UDEV_RULE")"
-    if printf "$FP_UDEV_CONTENT" "$controller" > "$FP_UDEV_RULE"; then
-        udevadm control --reload-rules || fail_reason="Failed to reload udev rules."
-        changed=1
-    else
-        fail_reason="Failed to write udev rule."
-    fi
-fi
-
-# 3. Kernel argument (GRUB)
-karg_rc=0
-add_kernel_arg "$FP_KARG" || karg_rc=$?
-if [[ $karg_rc -eq 0 ]]; then
-    changed=1
-    reboot_needed=1
-    bios_needed=1
-elif [[ $karg_rc -eq 1 ]]; then
-    karg_failed=1
-fi
-
-if [[ -n "$fail_reason" ]]; then
-    print_status "Fingerprint sensor tweaks" "error" "$fail_reason"
-elif [[ $changed -eq 1 ]]; then
-    print_status "Fingerprint sensor tweaks" "done"
+    stages_error=$((stages_error + 1))
+    fail_reason="Wake path not accessible."
 else
-    print_status "Fingerprint sensor tweaks" "not needed"
+    current=$(cat "$wake" 2>/dev/null || echo "")
+    if [[ "$current" != "disabled" ]]; then
+        if echo "disabled" | tee "$wake" >/dev/null; then
+            changed=1
+        else
+            fail_reason="Failed to disable PME."
+        fi
+    fi
+
+    # 2. Persistent udev rule
+    need_update=1
+    if [[ -f "$FP_UDEV_RULE" ]]; then
+        grep -q "KERNEL==\"$controller\"" "$FP_UDEV_RULE" && need_update=0
+    fi
+    if [[ $need_update -eq 1 ]]; then
+        mkdir -p "$(dirname "$FP_UDEV_RULE")"
+        if printf "$FP_UDEV_CONTENT" "$controller" > "$FP_UDEV_RULE"; then
+            udevadm control --reload-rules || fail_reason="Failed to reload udev rules."
+            changed=1
+        else
+            fail_reason="Failed to write udev rule."
+        fi
+    fi
+
+    # 3. Kernel argument (GRUB)
+    karg_rc=0
+    add_kernel_arg "$FP_KARG" || karg_rc=$?
+    if [[ $karg_rc -eq 0 ]]; then
+        changed=1
+        reboot_needed=1
+        bios_needed=1
+    elif [[ $karg_rc -eq 1 ]]; then
+        fail_reason="Could not automatically add kernel argument to GRUB."
+    fi
+
+    # Итог стадии
+    if [[ -n "$fail_reason" ]]; then
+        print_status "Fingerprint sensor tweaks" "error" "$fail_reason"
+        stages_error=$((stages_error + 1))
+    elif [[ $changed -eq 1 ]]; then
+        print_status "Fingerprint sensor tweaks" "done"
+        stages_ok=$((stages_ok + 1))
+    else
+        print_status "Fingerprint sensor tweaks" "not needed"
+        stages_ok=$((stages_ok + 1))
+    fi
 fi
 
 # -----------------------------------------------------------------------------
 # Final report
 # -----------------------------------------------------------------------------
-echo
+if [[ $stages_error -eq 0 ]]; then
+    echo -e "${GREEN}Fix installed successfully.${NC}"
+else
+    echo -e "${RED}Fix failed to install.${NC}"
+fi
+
 if [[ $reboot_needed -eq 1 ]]; then
-    echo -e "${YELLOW}Reboot required to apply the kernel argument.${NC}"
+    echo -e "${YELLOW}Reboot required to apply the fix.${NC}"
 fi
 if [[ $bios_needed -eq 1 ]]; then
-    echo -e "${YELLOW}Also, ensure BIOS setting:${NC}"
-    echo -e "${YELLOW}  Advanced -> ACPI Settings -> Enable ACPI Auto Configuration -> Enabled${NC}"
-fi
-if [[ $karg_failed -eq 1 ]]; then
-    echo -e "${YELLOW}WARNING: Could not automatically add kernel argument to GRUB.${NC}"
-    echo -e "${YELLOW}The udev rule fix (PCIe PME) is still active.${NC}"
-    echo -e "${YELLOW}To complete the fix manually:${NC}"
-    echo -e "${YELLOW}1. Edit /etc/default/grub and add '$FP_KARG' to GRUB_CMDLINE_LINUX_DEFAULT${NC}"
-    echo -e "${YELLOW}2. Run: sudo update-grub (or grub-mkconfig -o /boot/efi/EFI/steamos/grub.cfg)${NC}"
+    echo -e "${YELLOW}Also, ensure BIOS setting: Advanced -> ACPI Settings -> Enable ACPI Auto Configuration -> Enabled${NC}"
 fi
