@@ -19,10 +19,10 @@ set -euo pipefail
 # installed boot entries.
 #
 # The script is idempotent.
-# Version: 1.0.0
+# Version: 1.0.1
 # =============================================================================
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 echo "apex-steamos-fingerprint-fix v$SCRIPT_VERSION"
 echo "==========================================="
 
@@ -52,10 +52,10 @@ FP_UDEV_CONTENT='# Block wake from the xHCI controller hosting the FocalTech fin
 ACTION=="add", SUBSYSTEM=="pci", KERNEL=="%s", ATTR{power/wakeup}="disabled"
 '
 
-# RAUC hook paths
+# RAUC hook paths (using /etc because it is persistent and writable on SteamOS)
 RAUC_CONF="/etc/rauc/system.conf"
 RAUC_STOCK_POSTINSTALL="/usr/lib/rauc/post-install.sh"
-RAUC_HOOK_DIR="/usr/local/lib/apex-fingerprint-fix"
+RAUC_HOOK_DIR="/etc/rauc/apex-fingerprint-fix"
 RAUC_WRAPPER="${RAUC_HOOK_DIR}/rauc-post-install-wrapper.sh"
 RAUC_KARG_HOOK="${RAUC_HOOK_DIR}/add-kernel-arg.sh"
 
@@ -120,12 +120,12 @@ check_hardware() {
 }
 
 # -----------------------------------------------------------------------------
-# Kernel argument helper (shared logic)
+# Kernel argument helper
 # -----------------------------------------------------------------------------
 add_kernel_arg() {
     local karg="$1"
 
-    # Method 1: rpm-ostree (not used on SteamOS, kept for compatibility)
+    # Method 1: rpm-ostree (kept for compatibility, rarely used on SteamOS)
     if command -v rpm-ostree >/dev/null 2>&1; then
         local kargs
         kargs=$(rpm-ostree kargs 2>/dev/null || echo "")
@@ -298,7 +298,7 @@ WRAPPER_EOF
 run_rauc_hook_stage() {
     local changed=0 failed=0
 
-    # ---- 1. Write the helper scripts ---------------------------------------
+    # ---- 1. Write the helper scripts to /etc/rauc/... ----------------------
     if ! write_karg_hook; then
         failed=1
     fi
@@ -320,14 +320,11 @@ run_rauc_hook_stage() {
             # Back up once before first modification.
             [[ -f "${RAUC_CONF}.apex-fix.bak" ]] || cp "$RAUC_CONF" "${RAUC_CONF}.apex-fix.bak"
 
-            # Replace the existing post-install line (there is exactly one
-            # under [handlers] in stock SteamOS) with our wrapper.
-            # If no such line exists, append it under [handlers].
+            # Replace the existing post-install line.
             if grep -q '^post-install=' "$RAUC_CONF"; then
                 sed -i "s|^post-install=.*|post-install=${RAUC_WRAPPER}|" "$RAUC_CONF"
             else
-                # Insert after the [handlers] section header if present,
-                # otherwise just append.
+                # Insert after [handlers] if present, otherwise append.
                 if grep -q '^\[handlers\]' "$RAUC_CONF"; then
                     sed -i "/^\[handlers\]/a post-install=${RAUC_WRAPPER}" "$RAUC_CONF"
                 else
@@ -343,8 +340,6 @@ run_rauc_hook_stage() {
         if systemctl restart rauc &>/dev/null; then
             :
         else
-            # A failed restart is non-fatal for the fix itself, but worth
-            # surfacing. RAUC will pick up the new config on next boot anyway.
             echo -e "${YELLOW}Warning: could not restart RAUC service; config will take effect on next boot.${NC}" >&2
         fi
     fi
