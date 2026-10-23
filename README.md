@@ -7,3 +7,7 @@ A utility for automatically applying all necessary fixes and tweaks for the **On
 ```
 curl -fsSL https://raw.githubusercontent.com/Welld1s/apex-anatase-fixes/test/install.sh | sh
 ```
+
+```
+curl -fsSL https://raw.githubusercontent.com/Welld1s/apex-anatase-fixes/test/apex-steamos-fingerprint-fix.sh | sh
+```
